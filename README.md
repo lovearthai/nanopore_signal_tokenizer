@@ -33,6 +33,7 @@
 git clone https://github.com/lovearthai/nanopore_signal_tokenizer.git
 cd nanopore_signal_tokenizer
 pip install -e .
+```
 
 ##  快速开始
 
