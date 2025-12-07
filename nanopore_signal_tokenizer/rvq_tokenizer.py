@@ -200,6 +200,7 @@ class RVQTokenizer:
         stride: int = 11880,  # 👈 替代原来的 stride_factor，例如 12000 * 0.98 = 11760
         discard_feature: int = 5,
         downsample_rate: int = 12,
+        token_type:str = "L4"
     ):
         """
         初始化 tokenizer。
@@ -309,43 +310,73 @@ class RVQTokenizer:
         elif final_tokens.shape[0] < T_expected:
             pad = np.zeros((T_expected - final_tokens.shape[0], self.n_q), dtype=np.int64)
             final_tokens = np.concatenate([final_tokens, pad], axis=0)
-
+        # [L1_t0, L2_t0, L3_t0, L4_t0, L1_t1, L2_t1, L3_t1, L4_t1, ...]
         return final_tokens.flatten()
 
-    def tokenize_data(self, signal: np.ndarray, fs: int = None) -> np.ndarray:
+    def tokenize_data(self, signal: np.ndarray, fs: int = None, token_type: str = "L4") -> str:
         """
-        对原始浮点信号（scaled 后）进行 normalize + filter + tokenize。
-        适用于已从 FAST5 提取的 scaled 信号。
+        对原始浮点信号进行 normalize + filter + tokenize，并按 token_type 返回格式化字符串。
 
         Args:
             signal (np.ndarray): 1D 浮点信号（scaled，单位 pA）
             fs (int): 采样率（Hz），若为 None 则用 default_fs
+            token_type (str): "L1", "L2", "L3", or "L4"（默认 "L4"）
 
         Returns:
-            np.ndarray: 扁平 token array, shape=(T * n_q,)
+            str: 格式如 "<|bwav:L1_123|><|bwav:L2_456|>..."
         """
+        layer_map = {"L1": 1, "L2": 2, "L3": 3, "L4": 4}
+        if token_type not in layer_map:
+            raise ValueError(f"token_type must be one of {list(layer_map.keys())}, got {token_type}")
+        n_layers = layer_map[token_type]
+
         if fs is None:
             fs = self.default_fs
 
         # Normalize
         norm_sig = nanopore_normalize(signal)
         if norm_sig.size == 0:
-            return np.array([], dtype=np.int64)
+            return ""
 
         # Filter
         filtered = nanopore_filter(norm_sig, fs=fs, cutoff=self.cutoff, order=self.filter_order)
         if filtered.size == 0 or np.isnan(filtered).any():
-            return np.array([], dtype=np.int64)
+            return ""
 
-        # Tokenize
-        return self._tokenize_chunked_signal(filtered)
+        # Get flat token array from original method (unchanged)
+        flat_tokens = self._tokenize_chunked_signal(filtered)  # shape: (T * 4,)
+        if flat_tokens.size == 0:
+            return ""
 
-    def tokenize_read(self, read) -> np.ndarray:
+        # Reshape to (T, 4)
+        if flat_tokens.size % self.n_q != 0:
+            # Should not happen, but safe guard
+            T = flat_tokens.size // self.n_q
+            flat_tokens = flat_tokens[:T * self.n_q]
+        tokens_2d = flat_tokens.reshape(-1, self.n_q)  # (T, 4)
+
+        # Keep only first n_layers columns
+        selected = tokens_2d[:, :n_layers]  # (T, n_layers)
+
+        # Build formatted string
+        parts = []
+        for t in range(selected.shape[0]):
+            for q in range(n_layers):
+                token_id = int(selected[t, q])
+                parts.append(f"<|bwav:L{q+1}_{token_id}|>")
+        return "".join(parts)
+
+
+    def tokenize_read(self, read, token_type: str = "L4") -> str:
         """
-        直接 tokenize 一个 ont_fast5_api read 对象。
+        直接 tokenize 一个 ont_fast5_api read 对象，返回格式化 token 字符串。
+
+        Args:
+            read: fast5 read object
+            token_type: "L1", "L2", "L3", or "L4"
 
         Returns:
-            np.ndarray: 扁平 token array
+            str: formatted token string
         """
         # --- Scale ---
         channel_info = read.handle[read.global_key + 'channel_id'].attrs
@@ -360,7 +391,8 @@ class RVQTokenizer:
         except KeyError:
             fs = self.default_fs
 
-        return self.tokenize_data(scaled, fs=fs)
+        return self.tokenize_data(scaled, fs=fs, token_type=token_type)
+
 
     def tokenize_fast5_file(self, fast5_path: str, output_path: str):
         print(f"✅ Process {fast5_path}")
@@ -372,7 +404,7 @@ class RVQTokenizer:
                     token_array = self.tokenize_read(read)
                     if token_array.size == 0:
                         continue
-
+    
                     # Format as <|bwav:L1_x|><|bwav:L2_y|>...
                     token_list = token_array.tolist()
                     formatted_tokens = []
@@ -382,7 +414,7 @@ class RVQTokenizer:
                             token_id = token_list[idx]
                             formatted_tokens.append(f"<|bwav:L{q+1}_{token_id}|>")
                     text_field = "".join(formatted_tokens)
-
+    
                     results.append({
                         "id": read.read_id,
                         "text": text_field
@@ -390,7 +422,7 @@ class RVQTokenizer:
                 except Exception as e:
                     print(f"❌ Error on read {read.read_id} in {fast5_path}: {e}")
                     continue
-
+    
         # Save
         with gzip.open(output_path, 'wt', encoding='utf-8') as f:
             for item in results:

@@ -1,0 +1,11 @@
+README.md
+setup.py
+nanopore_signal_tokenizer/__init__.py
+nanopore_signal_tokenizer/fast5.py
+nanopore_signal_tokenizer/nanopore.py
+nanopore_signal_tokenizer/rvq_tokenizer.py
+nanopore_signal_tokenizer.egg-info/PKG-INFO
+nanopore_signal_tokenizer.egg-info/SOURCES.txt
+nanopore_signal_tokenizer.egg-info/dependency_links.txt
+nanopore_signal_tokenizer.egg-info/requires.txt
+nanopore_signal_tokenizer.egg-info/top_level.txt
