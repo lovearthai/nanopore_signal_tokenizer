@@ -401,23 +401,11 @@ class RVQTokenizer:
         with get_fast5_file(fast5_path, mode="r") as f5:
             for read in f5.get_reads():
                 try:
-                    token_array = self.tokenize_read(read)
-                    if token_array.size == 0:
-                        continue
-    
-                    # Format as <|bwav:L1_x|><|bwav:L2_y|>...
-                    token_list = token_array.tolist()
-                    formatted_tokens = []
-                    for t in range(len(token_list) // self.n_q):
-                        for q in range(self.n_q):
-                            idx = t * self.n_q + q
-                            token_id = token_list[idx]
-                            formatted_tokens.append(f"<|bwav:L{q+1}_{token_id}|>")
-                    text_field = "".join(formatted_tokens)
+                    token_str = self.tokenize_read(read)
     
                     results.append({
                         "id": read.read_id,
-                        "text": text_field
+                        "text": token_str
                     })
                 except Exception as e:
                     print(f"❌ Error on read {read.read_id} in {fast5_path}: {e}")
