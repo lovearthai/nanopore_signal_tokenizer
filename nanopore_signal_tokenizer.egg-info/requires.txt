@@ -2,3 +2,4 @@ ont-fast5-api
 numpy
 scipy
 pathos
+faiss-gpu

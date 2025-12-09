@@ -1,5 +1,5 @@
-Metadata-Version: 2.4
-Name: nanopore_signal_tokenizer
+Metadata-Version: 2.1
+Name: nanopore-signal-tokenizer
 Version: 0.1.0
 Summary: Tokenize Nanopore FAST5 signals into chunks with normalization and filtering
 Author: Your Name
@@ -11,8 +11,4 @@ Requires-Dist: ont-fast5-api
 Requires-Dist: numpy
 Requires-Dist: scipy
 Requires-Dist: pathos
-Dynamic: author
-Dynamic: classifier
-Dynamic: requires-dist
-Dynamic: requires-python
-Dynamic: summary
+Requires-Dist: faiss-gpu

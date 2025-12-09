@@ -231,7 +231,7 @@ class RVQTokenizer:
         self.model = self._load_model(model_ckpt)
         self.n_q = self.model.rvq.num_quantizers  # e.g., 4
     def _load_model(self, ckpt_path):
-        model = NanoporeRVQModel(n_q=4, codebook_size=65536)
+        model = NanoporeRVQModel(n_q=4, codebook_size=8192)
         state_dict = torch.load(ckpt_path, map_location=self.device)
         model.load_state_dict(state_dict)
         model.eval()
