@@ -9,21 +9,23 @@
 ---
 
 ## 🔍 简介
+本工具提供两种 Nanopore 原始电流信号（单位：pA）的 token 化方案，可将连续电流信号转换为结构化离散符号序列，适配不同建模需求：
+1. RVQ Tokenizer（残差矢量量化）
+基于自监督残差矢量量化（Residual VQ）模型实现信号 token 化，输出格式示例：<|bwav:L1_5336|><|bwav:L2_7466|><|bwav:L3_6973|><|bwav:L4_6340|>
 
-本工具基于 **自监督残差矢量量化（Residual VQ）** 模型，将 Nanopore 测序仪输出的原始电流信号（单位：pA）直接 tokenize 为结构化离散符号序列，格式如下：`<|bwav:L1_5336|><|bwav:L2_7466|><|bwav:L3_6973|><|bwav:L4_6340|>`
+核心特性：
+支持 L1~L4 多层级 token 输出，可灵活适配不同粒度的建模任务；
+兼容 FAST5 格式文件与原始浮点信号数组两种输入形式；
+内置信号归一化 + Butterworth 滤波流程，提升 token 化鲁棒性；
+支持长信号分块处理（滑动窗口 + 重叠策略），适配长序列建模场景
 
+2. KMeans Tokenizer（K 均值聚类）
+基于 K-Means 聚类算法实现信号 token 化：先通过聚类生成指定数量的聚类中心，再将电流信号切片为固定维度向量，通过匹配最相似的聚类中心向量，以聚类编号替换原始信号完成 token 化。
 
-- 支持 **多层级 token 输出**（L1 ~ L4），可灵活用于不同粒度的建模任务  
-- 兼容 **FAST5 文件** 和 **原始浮点信号数组**  
-- 内置 **信号归一化 + Butterworth 滤波**，提升鲁棒性  
-- 支持 **长信号分块处理**（sliding window with overlap）
-
-适用于：
-- Nanopore 信号语言建模（Signal LM）
-- 无参考序列的 RNA/DNA 表征学习
-- 多模态生物信息学 pipeline 构建
-
----
+适用场景
+Nanopore 信号语言建模（Signal LM）；
+无参考序列的 RNA/DNA 表征学习；
+多模态生物信息学分析流程（pipeline）构建。
 
 ## ⚙️ 安装
 
@@ -37,81 +39,10 @@ pip install -e .
 
 ##  快速开始
 
-###  加载预训练模型
-将你的 checkpoint（如 nanopore_rvq_tokenizer_chunk12k.pth）放入 models/ 目录。
+1. 预训练模型准备
+RVQ Tokenizer：将预训练 checkpoint 文件（如 nanopore_rvq_tokenizer_chunk12k.pth）放入项目 models/ 目录；
+KMeans Tokenizer：直接使用 models/ 目录下的 centroids.npy 聚类中心文件。
+2. 信号 Token 化示例
+RVQ Tokenizer 使用示例：参考 test/ 目录下 example_rvq_tokenizer_data.py；
+KMeans Tokenizer 使用示例：参考 test/ 目录下 example_kmeans_tokenize_data.py。
 
-### Tokenize 模拟信号
-
-```python
-# example_tokenize_data.py
-import numpy as np
-from nanopore_signal_tokenizer import RVQTokenizer
-
-tokenizer = RVQTokenizer(
-    model_ckpt="models/nanopore_rvq_tokenizer_chunk12k.pth",
-    device="cuda:0",
-    cutoff=1200,
-    chunk_size=12000,
-    downsample_rate=12
-)
-
-# 模拟一段 1200 点的信号（~240ms @ 5kHz）
-signal = np.random.randn(1200).astype(np.float32) * 5 + 100
-
-# 获取全部层级 token (L1–L4)
-tokens_all = tokenizer.tokenize_data(signal, fs=5000)
-print(tokens_all)
-# <|bwav:L1_5336|><|bwav:L2_7466|><|bwav:L3_6973|><|bwav:L4_6340|>...
-
-# 仅获取 L1 层
-tokens_L1 = tokenizer.tokenize_data(signal, token_type="L1", fs=5000)
-print(tokens_L1)
-# <|bwav:L1_5336|><|bwav:L1_434|><|bwav:L1_4037|>...
-```
-```python
-# example_kmeans_tokenize_data.py
-
-import numpy as np
-from nanopore_signal_tokenizer.kmeans_tokenizer import KmeansTokenizer
-
-tokenizer = KmeansTokenizer(
-    window_size=32,
-    stride=5,
-    centroids_path="[替换成当前环境路径]/nanopore_signal_tokenizer/nanopore_signal_tokenizer/kmeans/0.4b_centroids_8192.npy",
-)
-
-# 模拟一段 1200 点的信号（~240ms @ 5kHz）
-signal = np.random.randn(1200).astype(np.float32) * 5 + 100
-
-tokens_all = tokenizer.tokenize_data(signal)
-print(tokens_all)
-# <|bwav:5336|><|bwav:7466|><|bwav:6973|><|bwav:6340|>...
-### Tokenize FAST5 文件
-```
-
-```python
-tokenizer.tokenize_fast5_file(
-    fast5_path="sample.fast5",
-    output_path="output.jsonl.gz"
-)
-```
-输出为 gzip 压缩的 JSONL 格式：
-```
-{"id": "read_12345", "text": "<|bwav:L1_123|><|bwav:L2_456|>..."}
-{"id": "read_67890", "text": "<|bwav:L1_789|><|bwav:L2_012|>..."}
-```
-
-##  配置参数说明
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `model_ckpt` | 预训练模型路径 | 必填 |
-| `device` | 推理设备 | `"cuda"` |
-| `cutoff` | 滤波截止频率 (Hz) | `1200` |
-| `filter_order` | Butterworth 滤波器阶数 | `6` |
-| `default_fs` | 默认采样率 (Hz) | `5000` |
-| `chunk_size` | 模型输入长度（必须与训练一致） | `12000` |
-| `stride` | 分块滑动步长（用于长 read） | `11880` |
-| `discard_feature` | 每块两端丢弃的 token 数（防边界效应） | `0` |
-| `downsample_rate` | 编码器总下采样率 | `12` |
-
-> ✅ `token_type`（非初始化参数，用于 `tokenize_data` / `tokenize_read`）可选：`"L1"`, `"L2"`, `"L3"`, `"L4"`（默认 `"L4"`）

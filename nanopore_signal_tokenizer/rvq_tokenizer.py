@@ -230,6 +230,7 @@ class RVQTokenizer:
         self.model_ckpt_path = model_ckpt  # 👈 必须加这行！
         self.model = self._load_model(model_ckpt)
         self.n_q = self.model.rvq.num_quantizers  # e.g., 4
+        print(self.n_q)
     def _load_model(self, ckpt_path):
         model = NanoporeRVQModel(n_q=1, codebook_size=8192)
         state_dict = torch.load(ckpt_path, map_location=self.device)
@@ -373,7 +374,7 @@ class RVQTokenizer:
         return "".join(parts)
 
 
-    def tokenize_read(self, read, token_type: str = "L4") -> str:
+    def tokenize_read(self, read, token_type: str = "L1") -> str:
         """
         直接 tokenize 一个 ont_fast5_api read 对象，返回格式化 token 字符串。
 
@@ -384,18 +385,20 @@ class RVQTokenizer:
         Returns:
             str: formatted token string
         """
-        # --- Scale ---
-        channel_info = read.handle[read.global_key + 'channel_id'].attrs
-        offset = int(channel_info['offset'])
-        scaling = channel_info['range'] / channel_info['digitisation']
-        raw = read.handle[read.raw_dataset_name][:]
-        scaled = np.array(scaling * (raw + offset), dtype=np.float32)
-
-        # --- Get fs ---
         try:
-            fs = int(channel_info['sampling_rate'])
-        except KeyError:
-            fs = self.default_fs
+            # --- Scale ---
+            channel_info = read.handle[read.global_key + 'channel_id'].attrs
+            offset = int(channel_info['offset'])
+            scaling = channel_info['range'] / channel_info['digitisation']
+            raw = read.handle[read.raw_dataset_name][:]
+            scaled = np.array(scaling * (raw + offset), dtype=np.float32)
+            # --- Get fs ---
+            try:
+                fs = int(channel_info['sampling_rate'])
+            except KeyError:
+                fs = self.default_fs
+        except Exception as e:
+            print(f"❌ Error on read {read.read_id} in {fast5_path}: {e}")
 
         return self.tokenize_data(scaled, fs=fs, token_type=token_type)
 
