@@ -68,8 +68,26 @@ tokens_L1 = tokenizer.tokenize_data(signal, token_type="L1", fs=5000)
 print(tokens_L1)
 # <|bwav:L1_5336|><|bwav:L1_434|><|bwav:L1_4037|>...
 ```
+```python
+# example_kmeans_tokenize_data.py
 
+import numpy as np
+from nanopore_signal_tokenizer.kmeans_tokenizer import KmeansTokenizer
+
+tokenizer = KmeansTokenizer(
+    window_size=32,
+    stride=5,
+    centroids_path="[替换成当前环境路径]/nanopore_signal_tokenizer/nanopore_signal_tokenizer/kmeans/0.4b_centroids_8192.npy",
+)
+
+# 模拟一段 1200 点的信号（~240ms @ 5kHz）
+signal = np.random.randn(1200).astype(np.float32) * 5 + 100
+
+tokens_all = tokenizer.tokenize_data(signal)
+print(tokens_all)
+# <|bwav:5336|><|bwav:7466|><|bwav:6973|><|bwav:6340|>...
 ### Tokenize FAST5 文件
+```
 
 ```python
 tokenizer.tokenize_fast5_file(
