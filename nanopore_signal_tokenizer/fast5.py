@@ -6,7 +6,7 @@ import numpy as np
 import glob
 from ont_fast5_api.fast5_interface import get_fast5_file
 from .nanopore import nanopore_normalize, nanopore_filter
-
+from scipy.signal import medfilt
 
 class Fast5Dir:
     """
@@ -92,6 +92,13 @@ class Fast5Dir:
                     if norm_signal.size == 0:
                         print(f"⚠️ Empty after normalization for read {read.read_id}, skipped.")
                         continue
+                    
+                    # 原始信号: raw_signal (采样率 5000 Hz)
+                    # 典型 k-mer 持续时间 ≈ 2–5 ms → 对应 10–25 个采样点
+
+                    # 推荐窗口大小：3 ~ 7（奇数）
+                    medfilt_signal = medfilt(norm_signal, kernel_size=5)
+
 
                     # --- 3. 确定采样率：优先 read 自带，否则用全局默认 ---
                     fs_from_read = self.get_sampling_rate_from_read(read)
@@ -100,7 +107,7 @@ class Fast5Dir:
                     # --- 4. 滤波 ---
                     try:
                         filtered_signal = nanopore_filter(
-                            norm_signal, fs=fs, cutoff=cutoff, order=order
+                            medfilt_signal, fs=fs, cutoff=cutoff, order=order
                         )
                     except Exception as e:
                         print(f"⚠️ Filtering failed for read {read.read_id} (fs={fs}): {e}, skipped.")
@@ -143,7 +150,7 @@ class Fast5Dir:
         output_dir: str,
         window_size: int = 32,
         stride: int = 8,
-        cutoff: int = 1000,
+        cutoff: int = 1200,
         order: int = 6
     ):
         """

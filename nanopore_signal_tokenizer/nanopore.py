@@ -52,3 +52,6 @@ def nanopore_filter(signal_data, fs=5000, cutoff=1000, order=6):
      # ✅ 关键修复：确保返回 C-contiguous 的副本，避免负 stride
     return np.ascontiguousarray(filtered_signal, dtype=np.float32)
 
+
+from scipy.signal import medfilt
+

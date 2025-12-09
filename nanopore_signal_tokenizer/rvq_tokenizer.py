@@ -10,7 +10,7 @@ from math import ceil
 from ont_fast5_api.fast5_interface import get_fast5_file
 from .nanopore import nanopore_normalize, nanopore_filter
 from pathos.multiprocessing import ProcessingPool as Pool
-
+from scipy.signal import medfilt
 # train_nanopore_rvq.py
 # 本脚本目标：训练一个自监督模型，将 Nanopore 原始电流信号（5kHz）转换为离散 token 序列，
 # 用于后续语言模型（如 GPT）建模 DNA/RNA 序列。
@@ -231,7 +231,7 @@ class RVQTokenizer:
         self.model = self._load_model(model_ckpt)
         self.n_q = self.model.rvq.num_quantizers  # e.g., 4
     def _load_model(self, ckpt_path):
-        model = NanoporeRVQModel(n_q=4, codebook_size=8192)
+        model = NanoporeRVQModel(n_q=4, codebook_size=65536)
         state_dict = torch.load(ckpt_path, map_location=self.device)
         model.load_state_dict(state_dict)
         model.eval()
@@ -337,9 +337,15 @@ class RVQTokenizer:
         norm_sig = nanopore_normalize(signal)
         if norm_sig.size == 0:
             return ""
+        
+        # 原始信号: raw_signal (采样率 5000 Hz)
+        # 典型 k-mer 持续时间 ≈ 2–5 ms → 对应 10–25 个采样点
+
+        # 推荐窗口大小：3 ~ 7（奇数）
+        med_signal = medfilt(norm_sig, kernel_size=5)
 
         # Filter
-        filtered = nanopore_filter(norm_sig, fs=fs, cutoff=self.cutoff, order=self.filter_order)
+        filtered = nanopore_filter(med_signal, fs=fs, cutoff=self.cutoff, order=self.filter_order)
         if filtered.size == 0 or np.isnan(filtered).any():
             return ""
 
@@ -399,7 +405,7 @@ class RVQTokenizer:
         """内部方法：处理单个 FAST5 → JSONL.GZ"""
         results = []
         with get_fast5_file(fast5_path, mode="r") as f5:
-            for read in f5.get_reads():
+            for read in tqdm(f5.get_reads()):
                 try:
                     token_str = self.tokenize_read(read)
     
