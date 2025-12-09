@@ -11,7 +11,8 @@ setup(
         "ont-fast5-api",
         "numpy",
         "scipy",
-        "pathos"
+        "pathos",
+        "faiss-gpu"
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

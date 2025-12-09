@@ -26,7 +26,7 @@ from tqdm import tqdm            # 进度条显示
 
 # 替换 encodec RVQ 为轻量级实现
 from vector_quantize_pytorch import ResidualVQ
-from NanoporeEncoder import NanoporeEncoder  # 👈 添加这一行
+# from NanoporeEncoder import NanoporeEncoder  # 👈 添加这一行
 
 
 # train_nanopore_rvq.py
