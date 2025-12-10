@@ -5,428 +5,418 @@ import json
 import gzip
 import numpy as np
 import torch
-from multiprocessing import Process
 from math import ceil
 from ont_fast5_api.fast5_interface import get_fast5_file
 from .nanopore import nanopore_normalize, nanopore_filter
 from pathos.multiprocessing import ProcessingPool as Pool
 from scipy.signal import medfilt
-# train_nanopore_rvq.py
-# 本脚本目标：训练一个自监督模型，将 Nanopore 原始电流信号（5kHz）转换为离散 token 序列，
-# 用于后续语言模型（如 GPT）建模 DNA/RNA 序列。
-# 所有注释均为工业级详细说明，适合 PyTorch 新手理解。
-
-import os
-import torch                     # PyTorch 主库，用于张量计算和深度学习
-import torch.nn as nn            # 神经网络模块（如 Conv1d, BatchNorm, SiLU）
-import torch.nn.functional as F  # 函数式接口（如 loss, padding）
-from torch.utils.data import Dataset, DataLoader  # 数据加载工具
-import numpy as np               # 数值计算（生成模拟信号）
-from tqdm import tqdm            # 进度条显示
-
-# 替换 encodec RVQ 为轻量级实现
-from vector_quantize_pytorch import ResidualVQ
-# from NanoporeEncoder import NanoporeEncoder  # 👈 添加这一行
-
-
-# train_nanopore_rvq.py
-# 本脚本目标：训练一个自监督模型，将 Nanopore 原始电流信号（5kHz）转换为离散 token 序列，
-# 用于后续语言模型（如 GPT）建模 DNA/RNA 序列。
-# 所有注释均为工业级详细说明，适合 PyTorch 新手理解。
-
-import os
-import torch                     # PyTorch 主库，用于张量计算和深度学习
-import torch.nn as nn            # 神经网络模块（如 Conv1d, BatchNorm, SiLU）
-import torch.nn.functional as F  # 函数式接口（如 loss, padding）
-from torch.utils.data import Dataset, DataLoader  # 数据加载工具
-import numpy as np               # 数值计算（生成模拟信号）
-from tqdm import tqdm            # 进度条显示
-
-# 替换 encodec RVQ 为轻量级实现
-from vector_quantize_pytorch import ResidualVQ
-
-import torch.multiprocessing as mp
-mp.set_start_method('spawn', force=True)  # 👈 必须放在最开头！
-
-# ----------------------------
-# 2. Nanopore 专用编码器（严格按你提供的配置）
-# ----------------------------
-class NanoporeEncoder(nn.Module):
-    """
-    将原始信号 [B, 1, T] 编码为高维潜在表示 [B, 512, T//12]
-    结构完全按照你提供的 YAML 配置实现。
-    """
-    def __init__(self):
-        super().__init__()  # 必须调用父类初始化
-        layers = []  # 用来存放所有网络层
-
-        # Layer 1: 卷积层
-        layers.append(nn.Conv1d(1, 64, kernel_size=5, stride=1, padding=2, bias=True))
-        layers.append(nn.SiLU())
-        layers.append(nn.BatchNorm1d(64))
-
-        # Layer 2
-        layers.append(nn.Conv1d(64, 64, kernel_size=5, stride=1, padding=2, bias=True))
-        layers.append(nn.SiLU())
-        layers.append(nn.BatchNorm1d(64))
-
-        # Layer 3: 下采样 stride=3
-        layers.append(nn.Conv1d(64, 128, kernel_size=9, stride=3, padding=4, bias=True))
-        layers.append(nn.SiLU())
-        layers.append(nn.BatchNorm1d(128))
-
-        # Layer 4: stride=2
-        layers.append(nn.Conv1d(128, 128, kernel_size=9, stride=2, padding=4, bias=True))
-        layers.append(nn.SiLU())
-        layers.append(nn.BatchNorm1d(128))
-
-        # Layer 5: stride=2
-        layers.append(nn.Conv1d(128, 512, kernel_size=5, stride=2, padding=2, bias=True))
-        layers.append(nn.SiLU())
-        layers.append(nn.BatchNorm1d(512))
-
-        self.net = nn.Sequential(*layers)
-        self.total_stride = 1 * 1 * 3 * 2 * 2  # = 12
-
-    def forward(self, x):
-        z = self.net(x)
-        return z
-
-
-
-# train_nanopore_rvq.py
-# 本脚本目标：训练一个自监督模型，将 Nanopore 原始电流信号（5kHz）转换为离散 token 序列，
-# 用于后续语言模型（如 GPT）建模 DNA/RNA 序列。
-# 所有注释均为工业级详细说明，适合 PyTorch 新手理解。
-
-import os
-import torch                     # PyTorch 主库，用于张量计算和深度学习
-import torch.nn as nn            # 神经网络模块（如 Conv1d, BatchNorm, SiLU）
-import torch.nn.functional as F  # 函数式接口（如 loss, padding）
-from torch.utils.data import Dataset, DataLoader  # 数据加载工具
-import numpy as np               # 数值计算（生成模拟信号）
-from tqdm import tqdm            # 进度条显示
-
-# 替换 encodec RVQ 为轻量级实现
-from vector_quantize_pytorch import ResidualVQ
-
-
-# ----------------------------
-# 3. 完整 Tokenizer 模型（Encoder + RVQ + Decoder）
-# ----------------------------
-class NanoporeRVQModel(nn.Module):
-    """
-    完整的自编码器结构：
-    - Encoder: 压缩信号
-    - RVQ: 将连续 latent 离散化为 tokens
-    - Decoder: 从 tokens 重建原始信号（用于自监督训练）
-    """
-    def __init__(self, n_q=4, codebook_size=1024):
-        super().__init__()
-        self.encoder = NanoporeEncoder()
-        dim = 512
-
-        # 使用 vector_quantize_pytorch 的 ResidualVQ
-        self.rvq = ResidualVQ(
-            num_quantizers=n_q,
-            dim=dim,
-            codebook_size=codebook_size,
-            kmeans_init=True,           # 更稳定训练
-            kmeans_iters=10,
-            threshold_ema_dead_code=2   # 防止码本死亡
-        )
-
-        # 解码器：上采样 ×12
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose1d(dim, 256, kernel_size=8, stride=2, padding=3),
-            nn.SiLU(),
-            nn.BatchNorm1d(256),
-
-            nn.ConvTranspose1d(256, 128, kernel_size=12, stride=2, padding=5),
-            nn.SiLU(),
-            nn.BatchNorm1d(128),
-
-            nn.ConvTranspose1d(128, 64, kernel_size=18, stride=3, padding=8),
-            nn.SiLU(),
-            nn.BatchNorm1d(64),
-
-            nn.Conv1d(64, 1, kernel_size=1),
-        )
-        self.total_stride = self.encoder.total_stride
-
-
-    def forward(self, x):
-        z = self.encoder(x)  # [B, 512, T_enc]  e.g., [B, 512, 1000]
-
-        # 转置为 [B, T_enc, 512] —— 符合 vector_quantize_pytorch 的要求
-        z_transposed = z.permute(0, 2, 1)  # [B, T_enc, D]
-
-        # ResidualVQ expects [B, T, D]
-        z_q_transposed, indices, _ = self.rvq(z_transposed)
-
-        # 转回 [B, D, T_enc] 用于 decoder
-        z_q = z_q_transposed.permute(0, 2, 1)  # [B, 512, T_enc]
-
-        recon = self.decoder(z_q)  # [B, 1, T_rec]
-
-        # 对齐长度
-        if recon.shape[2] > x.shape[2]:
-            recon = recon[:, :, :x.shape[2]]
-        elif recon.shape[2] < x.shape[2]:
-            pad = x.shape[2] - recon.shape[2]
-            recon = F.pad(recon, (0, pad))
-
-        # indices is [B, T_enc, n_q] —— 这是合理的
-        return recon, indices
-
+from tqdm import tqdm
+from .rvq_model import NanoporeRVQModel
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*pkg_resources is deprecated.*",
+    category=UserWarning,
+    module="ont_fast5_api"
+)
 
 class RVQTokenizer:
     """
     Nanopore RVQ Tokenizer 封装类。
-
     功能：
         - 加载预训练 RVQ 模型
         - tokenize 单个 read / numpy 信号 / 整个 FAST5 目录
+
+    """
+
+    """
+    模型结构如下，你可以用这个打印去生成模型参数提取的代码
+
+    📂 Loading nanopore_rvq_tokenizer_chunk12k.pth...
+
+🔍 Type of checkpoint: <class 'collections.OrderedDict'>
+============================================================
+🔑 Top-level keys:
+  - encoder.net.0.weight: shape=(64, 1, 5), dtype=torch.float32
+  - encoder.net.0.bias: shape=(64,), dtype=torch.float32
+  - encoder.net.2.weight: shape=(64,), dtype=torch.float32
+  - encoder.net.2.bias: shape=(64,), dtype=torch.float32
+  - encoder.net.2.running_mean: shape=(64,), dtype=torch.float32
+  - encoder.net.2.running_var: shape=(64,), dtype=torch.float32
+  - encoder.net.2.num_batches_tracked: shape=(), dtype=torch.int64
+  - encoder.net.3.weight: shape=(64, 64, 5), dtype=torch.float32
+  - encoder.net.3.bias: shape=(64,), dtype=torch.float32
+  - encoder.net.5.weight: shape=(64,), dtype=torch.float32
+  - encoder.net.5.bias: shape=(64,), dtype=torch.float32
+  - encoder.net.5.running_mean: shape=(64,), dtype=torch.float32
+  - encoder.net.5.running_var: shape=(64,), dtype=torch.float32
+  - encoder.net.5.num_batches_tracked: shape=(), dtype=torch.int64
+  - encoder.net.6.weight: shape=(128, 64, 9), dtype=torch.float32
+  - encoder.net.6.bias: shape=(128,), dtype=torch.float32
+  - encoder.net.8.weight: shape=(128,), dtype=torch.float32
+  - encoder.net.8.bias: shape=(128,), dtype=torch.float32
+  - encoder.net.8.running_mean: shape=(128,), dtype=torch.float32
+  - encoder.net.8.running_var: shape=(128,), dtype=torch.float32
+  - encoder.net.8.num_batches_tracked: shape=(), dtype=torch.int64
+  - encoder.net.9.weight: shape=(128, 128, 9), dtype=torch.float32
+  - encoder.net.9.bias: shape=(128,), dtype=torch.float32
+  - encoder.net.11.weight: shape=(128,), dtype=torch.float32
+  - encoder.net.11.bias: shape=(128,), dtype=torch.float32
+  - encoder.net.11.running_mean: shape=(128,), dtype=torch.float32
+  - encoder.net.11.running_var: shape=(128,), dtype=torch.float32
+  - encoder.net.11.num_batches_tracked: shape=(), dtype=torch.int64
+  - encoder.net.12.weight: shape=(512, 128, 5), dtype=torch.float32
+  - encoder.net.12.bias: shape=(512,), dtype=torch.float32
+  - encoder.net.14.weight: shape=(512,), dtype=torch.float32
+  - encoder.net.14.bias: shape=(512,), dtype=torch.float32
+  - encoder.net.14.running_mean: shape=(512,), dtype=torch.float32
+  - encoder.net.14.running_var: shape=(512,), dtype=torch.float32
+  - encoder.net.14.num_batches_tracked: shape=(), dtype=torch.int64
+  - rvq.layers.0._codebook.initted: shape=(), dtype=torch.bool
+  - rvq.layers.0._codebook.cluster_size: shape=(1, 8192), dtype=torch.float32
+  - rvq.layers.0._codebook.embed_avg: shape=(1, 8192, 512), dtype=torch.float32
+  - rvq.layers.0._codebook.embed: shape=(1, 8192, 512), dtype=torch.float32
+  - rvq.layers.1._codebook.initted: shape=(), dtype=torch.bool
+  - rvq.layers.1._codebook.cluster_size: shape=(1, 8192), dtype=torch.float32
+  - rvq.layers.1._codebook.embed_avg: shape=(1, 8192, 512), dtype=torch.float32
+  - rvq.layers.1._codebook.embed: shape=(1, 8192, 512), dtype=torch.float32
+  - rvq.layers.2._codebook.initted: shape=(), dtype=torch.bool
+  - rvq.layers.2._codebook.cluster_size: shape=(1, 8192), dtype=torch.float32
+  - rvq.layers.2._codebook.embed_avg: shape=(1, 8192, 512), dtype=torch.float32
+  - rvq.layers.2._codebook.embed: shape=(1, 8192, 512), dtype=torch.float32
+  - rvq.layers.3._codebook.initted: shape=(), dtype=torch.bool
+  - rvq.layers.3._codebook.cluster_size: shape=(1, 8192), dtype=torch.float32
+  - rvq.layers.3._codebook.embed_avg: shape=(1, 8192, 512), dtype=torch.float32
+  - rvq.layers.3._codebook.embed: shape=(1, 8192, 512), dtype=torch.float32
+  - decoder.0.weight: shape=(512, 256, 8), dtype=torch.float32
+  - decoder.0.bias: shape=(256,), dtype=torch.float32
+  - decoder.2.weight: shape=(256,), dtype=torch.float32
+  - decoder.2.bias: shape=(256,), dtype=torch.float32
+  - decoder.2.running_mean: shape=(256,), dtype=torch.float32
+  - decoder.2.running_var: shape=(256,), dtype=torch.float32
+  - decoder.2.num_batches_tracked: shape=(), dtype=torch.int64
+  - decoder.3.weight: shape=(256, 128, 12), dtype=torch.float32
+  - decoder.3.bias: shape=(128,), dtype=torch.float32
+  - decoder.5.weight: shape=(128,), dtype=torch.float32
+  - decoder.5.bias: shape=(128,), dtype=torch.float32
+  - decoder.5.running_mean: shape=(128,), dtype=torch.float32
+  - decoder.5.running_var: shape=(128,), dtype=torch.float32
+  - decoder.5.num_batches_tracked: shape=(), dtype=torch.int64
+  - decoder.6.weight: shape=(128, 64, 18), dtype=torch.float32
+  - decoder.6.bias: shape=(64,), dtype=torch.float32
+  - decoder.8.weight: shape=(64,), dtype=torch.float32
+  - decoder.8.bias: shape=(64,), dtype=torch.float32
+  - decoder.8.running_mean: shape=(64,), dtype=torch.float32
+  - decoder.8.running_var: shape=(64,), dtype=torch.float32
+  - decoder.8.num_batches_tracked: shape=(), dtype=torch.int64
+  - decoder.9.weight: shape=(1, 64, 1), dtype=torch.float32
+  - decoder.9.bias: shape=(1,), dtype=torch.float32
+
+    📊 Sample tensor stats (first 3 parameters):
+    encoder.net.0.weight: mean=0.0004, std=0.2398, min=-0.6499, max=0.6512
+    encoder.net.0.bias: mean=-0.1649, std=0.5765, min=-1.3233, max=1.3681
+    encoder.net.2.weight: mean=0.6895, std=0.2447, min=0.2171, max=1.2953
+
     """
 
     def __init__(
         self,
         model_ckpt: str = "nanopore_rvq_tokenizer.pth",
-        device: str = "cuda",
-        cutoff: int = 1200,
-        filter_order: int = 6,
-        default_fs: int = 5000,
-        chunk_size: int = 12000,
-        stride: int = 11880,  # 👈 替代原来的 stride_factor，例如 12000 * 0.98 = 11760
-        discard_feature: int = 5,
-        downsample_rate: int = 12,
-        token_type:str = "L4"
+        device: str="cuda",
+        token_batch_size: int = 1000,
     ):
-        """
-        初始化 tokenizer。
+        try:
 
-        Args:
-            model_ckpt (str): RVQ 模型 checkpoint 路径。
-            device (str): 推理设备 ('cuda' or 'cpu')。
-            cutoff (int): 滤波截止频率 (Hz)。
-            filter_order (int): Butterworth 滤波器阶数。
-            default_fs (int): 默认采样率 (Hz)，当 read 无 metadata 时使用。
-            chunk_size (int): 模型输入 chunk 长度（必须与训练一致，如 12000）。
-            stride (int): 滑动窗口步长（单位：信号点），用于长 read 分块。典型值 = chunk_size - 2*discard_signal。
-            discard_feature (int): 每端丢弃的 token 数（对应 5 * 12 = 60 信号点）。
-            downsample_rate (int): RVQ 下采样率（通常为 12）。
-        """
-        self.device = device
-        self.cutoff = cutoff
-        self.filter_order = filter_order
-        self.default_fs = default_fs
-        self.chunk_size = chunk_size
-        self.stride = stride  # 👈 直接使用整数 stride
-        self.discard_feature = discard_feature
-        self.downsample_rate = downsample_rate
-        self.discard_signal = discard_feature * downsample_rate  # e.g., 60
+                    # --- Device setup: auto-select if not specified ---
+            if device is None:
+                # User didn't specify → auto choose
+                if torch.cuda.is_available():
+                    final_device = "cuda"
+                    print("✅ CUDA available. Using GPU (device='cuda').")
+                else:
+                    final_device = "cpu"
+                    print("⚠️ CUDA not available. Falling back to CPU.")
+            else:
+                # User specified a device → validate and use it
+                device = device.strip()
+                if device.startswith("cuda"):
+                    if torch.cuda.is_available():
+                        # Optional: validate GPU index if provided
+                        if ":" in device:
+                            try:
+                                idx = int(device.split(":")[1])
+                                if idx >= torch.cuda.device_count():
+                                    print(f"⚠️ Warning: CUDA device '{device}' not found. Available GPUs: 0-{torch.cuda.device_count() - 1}.")
+                                    final_device = "cuda:0"
+                                else:
+                                    final_device = device
+                            except (ValueError, IndexError):
+                                print(f"⚠️ Warning: Invalid CUDA device format '{device}'. Using 'cuda:0'.")
+                                final_device = "cuda:0"
+                        else:
+                            final_device = "cuda"  # normalize "cuda" → same as "cuda:0"
+                    else:
+                        print(f"⚠️ Warning: CUDA not available. Ignoring requested device '{device}', falling back to CPU.")
+                        final_device = "cpu"
+                elif device == "cpu":
+                    final_device = "cpu"
+                else:
+                    raise ValueError(f"Unsupported device: '{device}'. Use 'cpu', 'cuda', or 'cuda:N'.")
 
-        # Load model
-        self.model_ckpt_path = model_ckpt  # 👈 必须加这行！
-        self.model = self._load_model(model_ckpt)
-        self.n_q = self.model.rvq.num_quantizers  # e.g., 4
-        print(self.n_q)
-    def _load_model(self, ckpt_path):
-        model = NanoporeRVQModel(n_q=1, codebook_size=8192)
-        state_dict = torch.load(ckpt_path, map_location=self.device)
-        model.load_state_dict(state_dict)
-        model.eval()
-        model.to(self.device)
-        return model
+            self.device = final_device
+            # --- Load checkpoint ---
+            print(f"📂 Loading checkpoint from: {model_ckpt}")
+            ckpt_data = torch.load(model_ckpt, map_location='cpu')
+
+            # --- Infer n_q and codebook_size from RVQ embed keys ---
+            embed_keys = [k for k in ckpt_data.keys() if '._codebook.embed' in k]
+            if not embed_keys:
+                raise RuntimeError(
+                    "No RVQ codebook embedding found. Expected keys containing '._codebook.embed'."
+                )
+
+            # Sort to ensure consistent order (e.g., layers.0 first)
+            embed_keys = sorted(embed_keys)
+            print(f"🔍 Found {len(embed_keys)} RVQ codebook embed keys.")
+
+            # Get codebook_size from shape: expected (1, codebook_size, dim)
+            first_embed = ckpt_data[embed_keys[0]]
+            if not hasattr(first_embed, 'shape') or len(first_embed.shape) < 2:
+                raise RuntimeError(f"Unexpected tensor shape for {embed_keys[0]}: {first_embed.shape}")
+            codebook_size = int(first_embed.shape[1])
+
+            # Infer n_q from layer indices in key names
+            layer_indices = set()
+            for k in embed_keys:
+                parts = k.split('.')
+                try:
+                    # Format: 'rvq.layers.2._codebook.embed' → parts[2] = '2'
+                    if len(parts) >= 3 and parts[1] == 'layers':
+                        idx = int(parts[2])
+                        layer_indices.add(idx)
+                except (ValueError, IndexError):
+                    continue
+
+            if not layer_indices:
+                raise RuntimeError("Could not parse any valid layer index from codebook keys.")
+            n_q = max(layer_indices) + 1
+
+            self.n_q = n_q
+            self.codebook_size = codebook_size
+            print(f"🎯 Inferred model config: n_q={n_q}, codebook_size={codebook_size}")
+
+            # --- Instantiate model ---
+            self.model = NanoporeRVQModel(n_q=n_q, codebook_size=codebook_size)
+
+            # Ensure model defines cnn_stride (your downsample rate)
+            if not hasattr(self.model, 'cnn_stride'):
+                raise AttributeError(
+                    "NanoporeRVQModel must define 'self.cnn_stride' as the total downsampling rate (e.g., 12)."
+                )
+
+            if token_batch_size < 1:
+                token_batch_size = 1
+                print(f"token_batch_size forced to be {token_batch_size} due to miniumu requierment")
+
+            self.downsample_rate = self.model.cnn_stride
+            self.chunk_size = token_batch_size*self.downsample_rate
+            self.margin_stride_count = self.model.margin_stride_count
+            self.margin = self.model.margin_stride_count * self.downsample_rate
+            # --- Load state dict ---
+            self.model.load_state_dict(ckpt_data)
+            self.model.eval()
+            self.model.to(self.device)
+
+            # --- Final summary ---
+            print("\n✅ RVQTokenizer initialized successfully with the following configuration:")
+            print(f"   Model checkpoint : {os.path.abspath(model_ckpt)}")
+            print(f"   Device           : {self.device}")
+            print(f"   n_q              : {self.n_q}")
+            print(f"   Codebook size    : {self.codebook_size}")
+            print(f"   Downsample rate  : {self.downsample_rate} (from model.cnn_stride)")
+            print(f"   Chunk size       : {self.chunk_size}")
+            print(f"   Margin           : {self.margin} points")
+            print("-" * 60)
+
+        except Exception as e:
+            print(f"❌ Failed to initialize RVQTokenizer: {e}")
+            raise
 
     def _tokenize_chunked_signal(self, signal: np.ndarray) -> np.ndarray:
-        """
-        对任意长度信号进行分块 tokenize（带 discard 边界），返回扁平 token array。
-        内部处理 padding / overlap / discard。
-        """
+        """Tokenize long signal using symmetric sliding window with margin handling."""
         if signal.ndim != 1:
             raise ValueError("Signal must be 1D.")
         L = len(signal)
         if L == 0:
-            T_expected = (L + self.downsample_rate - 1) // self.downsample_rate
-            return np.zeros(T_expected * self.n_q, dtype=np.int64)
+            return np.zeros(0, dtype=np.int64)
 
-        if L < self.chunk_size:
+        T_expected = (L + self.downsample_rate - 1) // self.downsample_rate
+
+        # ────────────────────────
+        # Case 1: Short signal (no sliding needed)
+        # ────────────────────────
+        if L <= self.chunk_size:
             padded = np.pad(signal, (0, self.chunk_size - L), mode='constant')
             x = torch.from_numpy(padded).float().unsqueeze(0).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 _, tokens = self.model(x)
-            tokens = tokens.squeeze(0).cpu().numpy()  # [T_full, n_q]
+            tokens = tokens.squeeze(0).cpu().numpy()
+            # Only keep tokens corresponding to real signal
+            return tokens[:T_expected].flatten()
 
-            start_sig = self.discard_signal
-            end_sig = L - self.discard_signal
-            if start_sig >= end_sig:
-                T_expected = (L + self.downsample_rate - 1) // self.downsample_rate
-                return np.zeros(T_expected * self.n_q, dtype=np.int64)
+        # ────────────────────────
+        # Case 2: Long signal — sliding window
+        # ────────────────────────
+        margin_samples = self.margin_stride_count * self.downsample_rate
+        step_samples = self.chunk_size - 2 * margin_samples
+        if step_samples <= 0:
+            raise ValueError("chunk_size too small for the given margin.")
 
-            start_tok = int(np.ceil(start_sig / self.downsample_rate))
-            end_tok = int(np.floor(end_sig / self.downsample_rate))
-            end_tok = min(end_tok, tokens.shape[0])
-
-            if start_tok >= end_tok:
-                T_expected = (L + self.downsample_rate - 1) // self.downsample_rate
-                return np.zeros(T_expected * self.n_q, dtype=np.int64)
-
-            safe_tokens = tokens[start_tok:end_tok]
-            return safe_tokens.flatten()
-
-        # Long signal: sliding window
         all_tokens = []
         start = 0
-        while start < L:
-            end = start + self.chunk_size
-            if end > L:
-                chunk = np.pad(signal[start:], (0, end - L), mode='constant')
-            else:
-                chunk = signal[start:end]
+        chunk_index = 0
 
+        while start < L:
+            # Extract real signal segment
+            real_len = min(self.chunk_size, L - start)
+            chunk = signal[start:start + real_len]
+
+            # Pad only if necessary (for model input shape)
+            if len(chunk) < self.chunk_size:
+                chunk = np.pad(chunk, (0, self.chunk_size - len(chunk)), mode='constant')
+
+            # Run model
             x = torch.from_numpy(chunk).float().unsqueeze(0).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 _, tokens = self.model(x)
-            tokens = tokens.squeeze(0).cpu().numpy()  # [1000, n_q]
+            tokens = tokens.squeeze(0).cpu().numpy()  # [T, n_q]
 
-            if start == 0:
-                keep = tokens[:-self.discard_feature] if self.discard_feature > 0 else tokens
-            elif end >= L:
-                keep = tokens[self.discard_feature:] if self.discard_feature > 0 else tokens
+            # Compute how many tokens are valid (from real signal, not padding)
+            T_valid = (real_len + self.downsample_rate - 1) // self.downsample_rate
+
+            # ───── Margin handling ─────
+            kept_tokens = np.empty((0, self.n_q), dtype=tokens.dtype)
+
+            if chunk_index == 0:
+                # First chunk: discard tail margin
+                if self.margin_stride_count > 0:
+                    end_idx = min(tokens.shape[0] - self.margin_stride_count, T_valid)
+                    kept_tokens = tokens[:end_idx]
+                else:
+                    kept_tokens = tokens[:T_valid]
+
+            elif start + step_samples >= L:
+                # Last chunk: discard head margin, then respect T_valid
+                if self.margin_stride_count > 0:
+                    start_idx = self.margin_stride_count
+                    max_len = T_valid - self.margin_stride_count
+                    if max_len > 0:
+                        kept_tokens = tokens[start_idx : start_idx + max_len]
+                    # else: remains empty
+                else:
+                    kept_tokens = tokens[:T_valid]
+
             else:
-                keep = tokens[self.discard_feature:-self.discard_feature] if self.discard_feature > 0 else tokens
+                # Middle chunk: discard both ends
+                if self.margin_stride_count > 0 and tokens.shape[0] > 2 * self.margin_stride_count:
+                    max_len = T_valid - 2 * self.margin_stride_count
+                    if max_len > 0:
+                        kept_tokens = tokens[
+                            self.margin_stride_count : self.margin_stride_count + max_len
+                        ]
+                elif self.margin_stride_count == 0:
+                    kept_tokens = tokens[:T_valid]
 
-            all_tokens.append(keep)
-            start += (self.chunk_size - 2 * self.discard_signal)  # overlap by 2*discard_signal
+            # Append if any valid tokens remain
+            if kept_tokens.shape[0] > 0:
+                all_tokens.append(kept_tokens)
 
+            # Move window
+            start += step_samples
+            chunk_index += 1
+
+        # ────────────────────────
+        # Final assembly
+        # ────────────────────────
         if not all_tokens:
-            T_expected = (L + self.downsample_rate - 1) // self.downsample_rate
             return np.zeros(T_expected * self.n_q, dtype=np.int64)
 
         final_tokens = np.concatenate(all_tokens, axis=0)
-        T_expected = (L + self.downsample_rate - 1) // self.downsample_rate
+
+        # Trim or pad to expected length (optional in practice)
         if final_tokens.shape[0] > T_expected:
             final_tokens = final_tokens[:T_expected]
         elif final_tokens.shape[0] < T_expected:
             pad = np.zeros((T_expected - final_tokens.shape[0], self.n_q), dtype=np.int64)
             final_tokens = np.concatenate([final_tokens, pad], axis=0)
-        # [L1_t0, L2_t0, L3_t0, L4_t0, L1_t1, L2_t1, L3_t1, L4_t1, ...]
+
         return final_tokens.flatten()
 
-    def tokenize_data(self, signal: np.ndarray, fs: int = None, token_type: str = "L4") -> str:
-        """
-        对原始浮点信号进行 normalize + filter + tokenize，并按 token_type 返回格式化字符串。
+    def tokenize_data(self, signal: np.ndarray,  token_type: str = "L1") -> str:
+        try:
+            layer_map = {"L1": 1, "L2": 2, "L3": 3, "L4": 4,"L5":5,"L6":6,"L7":7,"L8":8}
 
-        Args:
-            signal (np.ndarray): 1D 浮点信号（scaled，单位 pA）
-            fs (int): 采样率（Hz），若为 None 则用 default_fs
-            token_type (str): "L1", "L2", "L3", or "L4"（默认 "L4"）
+            if token_type not in layer_map:
+                raise ValueError(f"token_type must be one of {list(layer_map.keys())}, got {token_type}")
+            n_layers = layer_map[token_type]
+            if n_layers > self.n_q:
+                raise ValueError(f"Requested {token_type} (n_layers={n_layers}), but model only has {self.n_q} quantizers.")
+            flat_tokens = self._tokenize_chunked_signal(signal)
+            if flat_tokens.size == 0:
+                return ""
 
-        Returns:
-            str: 格式如 "<|bwav:L1_123|><|bwav:L2_456|>..."
-        """
-        layer_map = {"L1": 1, "L2": 2, "L3": 3, "L4": 4}
-        if token_type not in layer_map:
-            raise ValueError(f"token_type must be one of {list(layer_map.keys())}, got {token_type}")
-        n_layers = layer_map[token_type]
 
-        if fs is None:
-            fs = self.default_fs
+            if flat_tokens.size % self.n_q != 0:
+                T = flat_tokens.size // self.n_q
+                flat_tokens = flat_tokens[:T * self.n_q]
+            tokens_2d = flat_tokens.reshape(-1, self.n_q)
+            selected = tokens_2d[:, :n_layers]
 
-        # Normalize
-        norm_sig = nanopore_normalize(signal)
-        if norm_sig.size == 0:
-            return ""
-        
-        # 原始信号: raw_signal (采样率 5000 Hz)
-        # 典型 k-mer 持续时间 ≈ 2–5 ms → 对应 10–25 个采样点
+            # === 计算 discard 信息 ===
+            #original_length = len(signal)
+            #expected_T = (original_length + self.downsample_rate - 1) // self.downsample_rate
+            #T_full = tokens_2d.shape[0]
+            # 可选：打印评估（或改用 logging）
+            #print(f"📊 Signal len: {original_length} → Tokens: {T_full} × {n_layers}")
 
-        # 推荐窗口大小：3 ~ 7（奇数）
-        med_signal = medfilt(norm_sig, kernel_size=5)
-
-        # Filter
-        filtered = nanopore_filter(med_signal, fs=fs, cutoff=self.cutoff, order=self.filter_order)
-        if filtered.size == 0 or np.isnan(filtered).any():
-            return ""
-
-        # Get flat token array from original method (unchanged)
-        flat_tokens = self._tokenize_chunked_signal(filtered)  # shape: (T * 4,)
-        if flat_tokens.size == 0:
-            return ""
-
-        # Reshape to (T, 4)
-        if flat_tokens.size % self.n_q != 0:
-            # Should not happen, but safe guard
-            T = flat_tokens.size // self.n_q
-            flat_tokens = flat_tokens[:T * self.n_q]
-        tokens_2d = flat_tokens.reshape(-1, self.n_q)  # (T, 4)
-
-        # Keep only first n_layers columns
-        selected = tokens_2d[:, :n_layers]  # (T, n_layers)
-
-        # Build formatted string
-        parts = []
-        for t in range(selected.shape[0]):
-            for q in range(n_layers):
-                token_id = int(selected[t, q])
-                parts.append(f"<|bwav:L{q+1}_{token_id}|>")
-        return "".join(parts)
+            parts = []
+            for t in range(selected.shape[0]):
+                for q in range(n_layers):
+                    token_id = int(selected[t, q])
+                    parts.append(f"<|bwav:L{q+1}_{token_id}|>")
+        except Exception as e:
+            print(f"❌ tokenize_data failed on signal of length {len(signal)}: {e}")
+            return []
+        return parts
 
 
     def tokenize_read(self, read, token_type: str = "L1") -> str:
-        """
-        直接 tokenize 一个 ont_fast5_api read 对象，返回格式化 token 字符串。
-
-        Args:
-            read: fast5 read object
-            token_type: "L1", "L2", "L3", or "L4"
-
-        Returns:
-            str: formatted token string
-        """
         try:
-            # --- Scale ---
             channel_info = read.handle[read.global_key + 'channel_id'].attrs
             offset = int(channel_info['offset'])
             scaling = channel_info['range'] / channel_info['digitisation']
             raw = read.handle[read.raw_dataset_name][:]
             scaled = np.array(scaling * (raw + offset), dtype=np.float32)
-            # --- Get fs ---
-            try:
-                fs = int(channel_info['sampling_rate'])
-            except KeyError:
-                fs = self.default_fs
         except Exception as e:
+            # 使用 read 所属文件路径（如果可用）
+            fast5_path = getattr(read.handle, 'filename', 'unknown.fast5')
             print(f"❌ Error on read {read.read_id} in {fast5_path}: {e}")
+            return ""
+        return self.tokenize_data(scaled,token_type=token_type)
 
-        return self.tokenize_data(scaled, fs=fs, token_type=token_type)
-
-
-    def tokenize_fast5_file(self, fast5_path: str, output_path: str):
+    def tokenize_fast5(self, fast5_path: str, output_path: str,token_type:str = "L1"):
         print(f"✅ Process {fast5_path}")
-        """内部方法：处理单个 FAST5 → JSONL.GZ"""
         results = []
         with get_fast5_file(fast5_path, mode="r") as f5:
-            for read in tqdm(f5.get_reads()):
+            for read in tqdm(f5.get_reads(), desc=os.path.basename(fast5_path)):
                 try:
-                    token_str = self.tokenize_read(read)
-    
-                    results.append({
-                        "id": read.read_id,
-                        "text": token_str
-                    })
+                    token_list = self.tokenize_read(read, token_type=token_type)  # 或传入参数
+                    token_str = "".join(token_list)
+                    results.append({"id": read.read_id, "text": token_str})
                 except Exception as e:
                     print(f"❌ Error on read {read.read_id} in {fast5_path}: {e}")
                     continue
-    
-        # Save
         with gzip.open(output_path, 'wt', encoding='utf-8') as f:
             for item in results:
                 f.write(json.dumps(item) + '\n')
         print(f"✅ Wrote {len(results)} reads to {output_path}")
-
-
-
-
-

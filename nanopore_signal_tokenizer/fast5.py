@@ -1,4 +1,7 @@
 # nanopore_signal_tokenizer/fast5.py
+
+import warnings
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
 from multiprocessing import Pool, cpu_count
 import functools
 import os
