@@ -217,26 +217,26 @@ class VQTokenizer:
             parts.append(f"<|bwav:{int(token_id)}|>")
         return parts
 
-    def tokenize_read(self, read, do_normalize: bool = True) -> list:
+    def tokenize_read(self, read, do_normalize: bool = True,medf: int = 0, lpf: int = 0) -> list:
         try:
             channel_info = read.handle[read.global_key + 'channel_id'].attrs
             offset = int(channel_info['offset'])
             scaling = channel_info['range'] / channel_info['digitisation']
             raw = read.handle[read.raw_dataset_name][:]
             scaled = np.array(scaling * (raw + offset), dtype=np.float32)
-            return self.tokenize_data(scaled, do_normalize)
+            return self.tokenize_data(scaled, do_normalize,medf,lpf)
         except Exception as e:
             fast5_path = getattr(read.handle, 'filename', 'unknown.fast5')
             print(f"❌ Error on read {read.read_id} in {fast5_path}: {e}")
             return []
 
-    def tokenize_fast5(self, fast5_path: str, output_path: str,do_normalize: bool = True):
+    def tokenize_fast5(self, fast5_path: str, output_path: str,do_normalize: bool = True,medf: int = 0, lpf: int = 0):
         print(f"✅ Processing {fast5_path}")
         results = []
         with get_fast5_file(fast5_path, mode="r") as f5:
             for read in tqdm(f5.get_reads(), desc=os.path.basename(fast5_path)):
                 try:
-                    token_list = self.tokenize_read(read, do_normalize)
+                    token_list = self.tokenize_read(read, do_normalize,medf,lpf)
                     token_str = "".join(token_list)
                     results.append({"id": read.read_id, "text": token_str})
                 except Exception as e:
