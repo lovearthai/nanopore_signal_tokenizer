@@ -1,4 +1,11 @@
 # nanopore_signal_tokenizer/rvq_tokenizer.py
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*pkg_resources is deprecated.*",
+    category=UserWarning,
+    module="ont_fast5_api"
+)
 
 import os
 import json
@@ -12,13 +19,6 @@ from pathos.multiprocessing import ProcessingPool as Pool
 from scipy.signal import medfilt
 from tqdm import tqdm
 from .rvq_model import NanoporeRVQModel
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    message=".*pkg_resources is deprecated.*",
-    category=UserWarning,
-    module="ont_fast5_api"
-)
 
 class RVQTokenizer:
     """
@@ -352,10 +352,12 @@ class RVQTokenizer:
 
         return final_tokens.flatten()
 
-    def tokenize_data(self, signal: np.ndarray,  token_type: str = "L1") -> str:
+    def tokenize_data(self, signal: np.ndarray, token_type: str = "L1", do_normalize: bool = True) -> list:
         try:
-            layer_map = {"L1": 1, "L2": 2, "L3": 3, "L4": 4,"L5":5,"L6":6,"L7":7,"L8":8}
-
+            # === 可选：标准化信号 ===
+            if do_normalize:
+                signal = nanopore_normalize(signal)
+            layer_map = {"L1": 1, "L2": 2, "L3": 3, "L4": 4, "L5": 5, "L6": 6, "L7": 7, "L8": 8}
             if token_type not in layer_map:
                 raise ValueError(f"token_type must be one of {list(layer_map.keys())}, got {token_type}")
             n_layers = layer_map[token_type]
@@ -363,59 +365,51 @@ class RVQTokenizer:
                 raise ValueError(f"Requested {token_type} (n_layers={n_layers}), but model only has {self.n_q} quantizers.")
             flat_tokens = self._tokenize_chunked_signal(signal)
             if flat_tokens.size == 0:
-                return ""
-
-
+                return []
             if flat_tokens.size % self.n_q != 0:
                 T = flat_tokens.size // self.n_q
                 flat_tokens = flat_tokens[:T * self.n_q]
             tokens_2d = flat_tokens.reshape(-1, self.n_q)
             selected = tokens_2d[:, :n_layers]
-
-            # === 计算 discard 信息 ===
-            #original_length = len(signal)
-            #expected_T = (original_length + self.downsample_rate - 1) // self.downsample_rate
-            #T_full = tokens_2d.shape[0]
-            # 可选：打印评估（或改用 logging）
-            #print(f"📊 Signal len: {original_length} → Tokens: {T_full} × {n_layers}")
-
             parts = []
             for t in range(selected.shape[0]):
                 for q in range(n_layers):
                     token_id = int(selected[t, q])
                     parts.append(f"<|bwav:L{q+1}_{token_id}|>")
+            return parts
+
         except Exception as e:
             print(f"❌ tokenize_data failed on signal of length {len(signal)}: {e}")
             return []
-        return parts
 
 
-    def tokenize_read(self, read, token_type: str = "L1") -> str:
+    def tokenize_read(self, read, token_type: str = "L1", do_normalize: bool = True) -> list:
         try:
             channel_info = read.handle[read.global_key + 'channel_id'].attrs
             offset = int(channel_info['offset'])
             scaling = channel_info['range'] / channel_info['digitisation']
             raw = read.handle[read.raw_dataset_name][:]
             scaled = np.array(scaling * (raw + offset), dtype=np.float32)
+            return self.tokenize_data(scaled, token_type=token_type, do_normalize=do_normalize)
         except Exception as e:
-            # 使用 read 所属文件路径（如果可用）
             fast5_path = getattr(read.handle, 'filename', 'unknown.fast5')
             print(f"❌ Error on read {read.read_id} in {fast5_path}: {e}")
-            return ""
-        return self.tokenize_data(scaled,token_type=token_type)
+            return []
 
-    def tokenize_fast5(self, fast5_path: str, output_path: str,token_type:str = "L1"):
-        print(f"✅ Process {fast5_path}")
+
+    def tokenize_fast5(self, fast5_path: str, output_path: str, token_type: str = "L1", do_normalize: bool = True):
+        print(f"✅ Processing {fast5_path} (normalize={do_normalize})")
         results = []
         with get_fast5_file(fast5_path, mode="r") as f5:
             for read in tqdm(f5.get_reads(), desc=os.path.basename(fast5_path)):
                 try:
-                    token_list = self.tokenize_read(read, token_type=token_type)  # 或传入参数
+                    token_list = self.tokenize_read(read, token_type=token_type, do_normalize=do_normalize)
                     token_str = "".join(token_list)
                     results.append({"id": read.read_id, "text": token_str})
                 except Exception as e:
                     print(f"❌ Error on read {read.read_id} in {fast5_path}: {e}")
                     continue
+
         with gzip.open(output_path, 'wt', encoding='utf-8') as f:
             for item in results:
                 f.write(json.dumps(item) + '\n')

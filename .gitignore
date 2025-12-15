@@ -1,0 +1,6 @@
+# Model checkpoints and numpy arrays
+*.pth
+*.npy
+*.bin
+*.gz
+*.out
