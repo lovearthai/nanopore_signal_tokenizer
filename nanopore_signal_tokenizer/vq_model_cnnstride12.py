@@ -51,12 +51,12 @@ class NanoporeVQModel(nn.Module):
         #       RF3 = 9 + (25-1)*1 = 33  ← ≈1 个 RNA 碱基 (4000/130 ≈ 31)
         #   通道: 32 → 64
         #   注意: 使用 Tanh 而非 SiLU —— 限制输出范围，利于 VQ 稳定训练
-        encoder_layers.append(nn.Conv1d(32, self.latent_dim, kernel_size=25, stride=5, padding=12, bias=True))
+        encoder_layers.append(nn.Conv1d(32, self.latent_dim, kernel_size=25, stride=12, padding=12, bias=True))
         encoder_layers.append(nn.Tanh())          # 推荐：避免 VQ 输入动态范围过大
         encoder_layers.append(nn.BatchNorm1d(self.latent_dim))
 
         self.encoder = nn.Sequential(*encoder_layers)
-        self.cnn_stride = 1 * 1 * 5  # = 5
+        self.cnn_stride = 1 * 1 * 12  # = 12
         self.margin_stride_count = 12
         self.RF = 33
         # ======================================================================
@@ -114,7 +114,7 @@ class NanoporeVQModel(nn.Module):
                 in_channels=self.latent_dim,
                 out_channels=64,
                 kernel_size=25,         # 与 encoder 最后一层相同
-                stride=5,               # 与 encoder 相同
+                stride=12,               # 与 encoder 相同
                 padding=12,             # 与 encoder 相同（保证中心对齐）
                 output_padding=0,       # 若长度偏差 ≤1，靠 final pad 补偿
                 bias=False

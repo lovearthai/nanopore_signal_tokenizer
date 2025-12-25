@@ -14,51 +14,6 @@ from typing import Dict, List
 import collections
 from .dwa import DynamicWeightAverager 
 
-# ========== 评估函数（仅在 do_evaluate=True 时调用）==========
-import json
-from pprint import pformat
-
-# ====== 打印所有训练参数 ======
-def print_training_args(**kwargs):
-    print("\n" + "="*60)
-    print(" 🚀 Starting VQ Training with the following configuration:")
-    print("="*60)
-    # 使用 pprint 美化输出（保留类型信息，如 True/False/None）
-    print(pformat(kwargs, width=100, sort_dicts=False))
-    print("="*60 + "\n")
-
-
-# ====== 定义一个保存函数（放在 vq_train 内部，例如在 model 初始化之后）======
-def save_full_checkpoint(
-    path: str,
-    model,
-    optimizer,
-    scheduler,
-    epoch: int,
-    spoch: int,
-    global_step: int,
-    rank: int
-):
-    if rank != 0:
-        return
-
-    checkpoint = {
-        'epoch': epoch,
-        'spoch': spoch,
-        'global_step': global_step,
-        'model_state_dict': model.module.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'rng_state': torch.get_rng_state(),
-        'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-        'numpy_rng_state': np.random.get_state(),
-    }
-
-    if scheduler is not None:
-        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-    torch.save(checkpoint, path)
-    print(f"✅ Full checkpoint saved to {path}")
-
-
 def log_and_save(
     epoch: int,
     step: int,
@@ -176,42 +131,7 @@ def vq_train(
     main_scheduler_end_factor: float = 1e-6,    # 主调度器最终 lr = lr * end_factor（仅 linear 用）
     save_checkpoint_every_spoch: int = 1000,    # 每多少个update_loss_weight_every进行一次检查点保存
     evaluate_every_spoch: int = 1000,           # 每多少个update_loss_weight_every进行一次evaluate
-    checkpoint_path : str = None
 ):
-    # 调用：传入所有参数
-    print_training_args(
-        npy_dir=npy_dir,
-        output_model_path=output_model_path,
-        batch_size=batch_size,
-        lr=lr,
-        num_epochs=num_epochs,
-        codebook_size=codebook_size,
-        codebook_dim=codebook_dim,
-        chunk_size=chunk_size,
-        num_workers=num_workers,
-        update_loss_weight_every=update_loss_weight_every,
-        prefetch_factor=prefetch_factor,
-        val_ratio=val_ratio,
-        do_evaluate=do_evaluate,
-        commitment_weight=commitment_weight,
-        codebook_diversity_loss_weight=codebook_diversity_loss_weight,
-        orthogonal_reg_weight=orthogonal_reg_weight,
-        loss_log_interval=loss_log_interval,
-        loss_csv_path=loss_csv_path,
-        use_wandb=use_wandb,
-        wandb_project=wandb_project,
-        wandb_name=wandb_name,
-        lr_scheduler_type=lr_scheduler_type,
-        warmup_steps=warmup_steps,
-        warmup_start_factor=warmup_start_factor,
-        warmup_end_factor=warmup_end_factor,
-        main_scheduler_end_factor=main_scheduler_end_factor,
-        save_checkpoint_every_spoch=save_checkpoint_every_spoch,
-        evaluate_every_spoch=evaluate_every_spoch,
-        checkpoint_path=checkpoint_path,
-    )
-
-
     """
     分布式训练 Nanopore VQ tokenizer。
     现在会分别打印：重建损失、commitment 损失、总损失。
@@ -219,10 +139,6 @@ def vq_train(
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.utils.data.distributed import DistributedSampler
-
-    if checkpoint_path and not os.path.isfile(checkpoint_path):
-        print(f"Required checkpoint not found: {checkpoint_path}")
-        checkpoint_path = None
 
     # 初始化分布式环境
     dist.init_process_group(backend="nccl")
@@ -304,23 +220,6 @@ def vq_train(
 
     # ========== 可选：验证集（仅用于评估）==========
     val_loader = None
-    def evaluate_codebook_usage():
-        if val_loader is None:  # ⭐ 安全检查
-            return 0.0, 0
-        model.eval()
-        used_codes = set()
-        total_tokens = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                x = batch.to(device)
-                _, indices, _, _ = model.module(x)
-                indices = indices.cpu().numpy().flatten()
-                used_codes.update(indices.tolist())
-                total_tokens += indices.size
-        usage_ratio = len(used_codes) / codebook_size
-        model.train()
-        return usage_ratio, total_tokens
-
     if do_evaluate and rank == 0:  # ⭐ 只在 rank 0 创建 val_loader（其他 rank 不需要）
         actual_val_size = int(val_ratio *len(dataset))
         if actual_val_size < 1:
@@ -342,8 +241,9 @@ def vq_train(
             codebook_diversity_loss_weight=codebook_diversity_loss_weight,
             orthogonal_reg_weight=orthogonal_reg_weight
             ).to(device)
+    model = DDP(model, device_ids=[local_device_id])
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
+
 
 
 
@@ -432,98 +332,25 @@ def vq_train(
             milestones=[warmup_steps]
         )
     # else: scheduler remains None → constant LR
-     # 👇 👇 👇 就在这里插入加载 checkpoint 的逻辑 👇 👇 👇
-    start_epoch = 0
-    start_spoch = 0
-    start_global_step = 0
-    loaded_dwa_state = None
 
-    start_epoch = 0
-    start_spoch = 0
-    start_global_step = 0
-    loaded_dwa_state = None
+    # ========== 评估函数（仅在 do_evaluate=True 时调用）==========
 
-    # ===== 检查并加载 checkpoint =====
-    if checkpoint_path is not None and isinstance(checkpoint_path, str) and checkpoint_path.strip():
-        # 仅 rank 0 检查文件是否存在（可选：也可让所有 rank 检查）
-        if rank == 0:
-            if not os.path.isfile(checkpoint_path):
-                print(f"⚠️ Warning: checkpoint_path '{checkpoint_path}' does not exist. Training from scratch.")
-                checkpoint_path = None  # 重置为 None，避免后续加载
-            else:
-                print(f"📥 Loading checkpoint from: {checkpoint_path}")
-        
-        # 同步：确保所有 rank 知道是否要加载（防止 rank != 0 卡住）
-        # 方法：通过一个共享的 flag 张量
-        load_flag = torch.tensor([1 if checkpoint_path is not None else 0], dtype=torch.int32, device=device)
-        if rank == 0:
-            load_flag[0] = int(os.path.isfile(checkpoint_path)) if checkpoint_path else 0
-        dist.broadcast(load_flag, src=0)
-        
-        if load_flag.item() == 1:
-            # 所有 rank 加载（map_location 自动处理设备）
-            ckpt = torch.load(checkpoint_path, map_location=device,weights_only=False)
-
-            model.load_state_dict(ckpt['model_state_dict'])
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-            if scheduler is not None and 'scheduler_state_dict' in ckpt:
-                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-
-            # 恢复随机状态（仅 rank 0）
-            if rank == 0:
-                # Step 2: Safely restore PyTorch RNG state
-                raw_rng = ckpt['rng_state']
-                
-                # Convert to bytes if needed
-                if isinstance(raw_rng, torch.Tensor):
-                    # Tensor case: ensure uint8 and contiguous
-                    rng_bytes = raw_rng.cpu().numpy().tobytes()
-                elif isinstance(raw_rng, np.ndarray):
-                    rng_bytes = raw_rng.tobytes()
-                elif isinstance(raw_rng, bytes):
-                    rng_bytes = raw_rng
-                else:
-                    raise TypeError(f"Unexpected type for rng_state: {type(raw_rng)}")
-                
-                # Reconstruct as proper ByteTensor
-                rng_state = torch.frombuffer(rng_bytes, dtype=torch.uint8).contiguous()
-                torch.set_rng_state(rng_state)
-                
-                # Optional: Restore CUDA RNG if available
-                if 'cuda_rng_state' in ckpt and ckpt['cuda_rng_state'] is not None:
-                    raw_cuda_rng = ckpt['cuda_rng_state']
-                    if isinstance(raw_cuda_rng, torch.Tensor):
-                        cuda_bytes = raw_cuda_rng.cpu().numpy().tobytes()
-                    elif isinstance(raw_cuda_rng, np.ndarray):
-                        cuda_bytes = raw_cuda_rng.tobytes()
-                    elif isinstance(raw_cuda_rng, bytes):
-                        cuda_bytes = raw_cuda_rng
-                    else:
-                        raise TypeError(f"Unexpected type for cuda_rng_state: {type(raw_cuda_rng)}")
-                    cuda_rng_state = torch.frombuffer(cuda_bytes, dtype=torch.uint8).contiguous()
-                    torch.cuda.set_rng_state(cuda_rng_state)
-                
-                # Optional: Restore NumPy RNG
-                if 'numpy_rng_state' in ckpt:
-                    np.random.set_state(ckpt['numpy_rng_state'])
-                    start_epoch = ckpt.get('epoch', -1) + 1
-                    start_spoch = ckpt.get('spoch', -1) + 1
-                    start_global_step = ckpt.get('global_step', 0)
-
-            if rank == 0:
-                print(f"✅ Resuming from epoch {start_epoch}, spoch {start_spoch}")
-        else:
-            # 文件不存在，从头训练
-            if rank == 0:
-                print("⏭️  No valid checkpoint found. Starting training from scratch.")
-    else:
-        if rank == 0 and checkpoint_path is not None:
-            print("⚠️  Invalid checkpoint_path (empty or not a string). Ignoring.")
-
-    #model = DDP(model, device_ids=[local_device_id],find_unused_parameters=True )
-    model = DDP(model, device_ids=[local_device_id])
-
-   
+    def evaluate_codebook_usage():
+        if val_loader is None:  # ⭐ 安全检查
+            return 0.0, 0
+        model.eval()
+        used_codes = set()
+        total_tokens = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                x = batch.to(device)
+                _, indices, _, _ = model.module(x)
+                indices = indices.cpu().numpy().flatten()
+                used_codes.update(indices.tolist())
+                total_tokens += indices.size
+        usage_ratio = len(used_codes) / codebook_size
+        model.train()
+        return usage_ratio, total_tokens
     # ========== 训练循环 ==========
     model.train()
     codebook_usage = 0.0
@@ -539,16 +366,13 @@ def vq_train(
         "diver": []
     }
     # 每10个step就是一个spoch
-    # 在 resume 逻辑之后，初始化 global_step
-    global_step = start_global_step
-    spoch = start_spoch
+    spoch = 0
     total_spochs = int(total_steps/update_loss_weight_every)
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(num_epochs):
         epoch_start_time = time.time()  # ← 新增：记录 epoch 开始时间
         sampler.set_epoch(epoch)
         num_batches = torch.tensor(len(dataloader), device=device)
         for step, batch in enumerate(dataloader):
-            global_step += 1  # 👈 关键：每步 +1
             x = batch.to(device)
             # break_loss 是否已包含 commitment_weight？
             # 在 vector_quantize_pytorch 中，返回的 break_loss 已经是乘过 commitment_weight 的（默认 0.25）
@@ -566,13 +390,10 @@ def vq_train(
             diver_loss = loss_breakdown.codebook_diversity
             ortho_loss = loss_breakdown.orthogonal_reg
             #print("comit_loss grad:", comit_loss.requires_grad) # True
-            #total_loss = (recon_loss + 
-            #    comit_loss * (commitment_weight+epoch) + 
-            #    ortho_loss * orthogonal_reg_weight + 
-            #    diver_loss * codebook_diversity_loss_weight)
             total_loss = (recon_loss + 
-                comit_loss * (commitment_weight) )
-            
+                comit_loss * (commitment_weight+epoch) + 
+                ortho_loss * orthogonal_reg_weight + 
+                diver_loss * codebook_diversity_loss_weight)
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -635,6 +456,7 @@ def vq_train(
                 if rank == 0:
                     current_lr = optimizer.param_groups[0]['lr']
                     # 获取最新 fast loss（可用于日志、调试、监控）
+                    global_step = epoch * len(dataloader) + (step + 1)
                     log_and_save(
                         epoch=epoch,
                         step=global_step,
@@ -682,30 +504,12 @@ def vq_train(
                 if rank == 0 and (spoch + 1)% save_checkpoint_every_spoch == 0:
                     # ✅ 检查点保存逻辑（仅 rank 0）
                     checkpoint_path = f"{output_model_path}.spoch{spoch+1}.pth"
-                    save_full_checkpoint(
-                        path=checkpoint_path,
-                        model=model,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        epoch=epoch,
-                        spoch=spoch,
-                        global_step=global_step,
-                        rank=rank
-                    )
+                    torch.save(model.module.state_dict(), checkpoint_path)
                     print(f"✅ Checkpoint saved to {checkpoint_path}")
 
     # 保存最终模型（仅 rank 0）
     if rank == 0:
-        save_full_checkpoint(
-            path=output_model_path,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            epoch=num_epochs - 1,
-            spoch=spoch,
-            global_step=final_step,
-            rank=rank
-        )
+        torch.save(model.module.state_dict(), output_model_path)
         print(f"✅ Final model saved to {output_model_path}")
         if use_wandb:
             wandb.finish()  # ✅ 正确关闭

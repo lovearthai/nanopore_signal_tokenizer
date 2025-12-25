@@ -18,9 +18,9 @@ class NanoporeVQModel(nn.Module):
     适用于：VQ tokenizer + LLM basecalling pipeline
     """
 
-    def __init__(self, codebook_size=8192, codebook_dim= 64, commitment_weight=1.0,orthogonal_reg_weight=1.0,codebook_diversity_loss_weight=1.0):
+    def __init__(self, codebook_size=8192, commitment_weight=2.0):
         super().__init__()
-        self.latent_dim = codebook_dim  # VQ embedding 维度，也是 encoder 最终输出通道数
+        self.latent_dim = 64  # VQ embedding 维度，也是 encoder 最终输出通道数
         # ======================================================================
         # ENCODER: 3 层 Conv1D，逐步提取局部 squiggle 特征
         # 总 stride = 1 * 1 * 5 = 5
@@ -57,31 +57,12 @@ class NanoporeVQModel(nn.Module):
 
         self.encoder = nn.Sequential(*encoder_layers)
         self.cnn_stride = 1 * 1 * 5  # = 5
-        self.margin_stride_count = 12
+        self.margin_stride_count = 5
         self.RF = 33
         # ======================================================================
         # VECTOR QUANTIZATION (VQ)
         # 在 64 维空间中离散化连续表示，生成可学习的 codebook
         # ======================================================================
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-        else:
-            rank = 0
-
-        if rank == 0:
-            print("Intialized VectorQuantize with the following hyperparameters:")
-            print(f"  dim: {self.latent_dim}")
-            print(f"  codebook_size: {codebook_size}")
-            print(f"  kmeans_init: True")
-            print(f"  kmeans_iters: 10")
-            print(f"  decay: 0.99")
-            print(f"  threshold_ema_dead_code: 2")
-            print(f"  commitment_weight: {commitment_weight}")
-            print(f"  codebook_diversity_loss_weight: {codebook_diversity_loss_weight}")
-            print(f"  orthogonal_reg_weight: {orthogonal_reg_weight}")
-            print(f"  orthogonal_reg_max_codes: 256")
-            print(f"  orthogonal_reg_active_codes_only: True")
-            print("-" * 60)
         self.vq = VectorQuantize(
             dim=self.latent_dim,
             codebook_size=codebook_size,
@@ -90,13 +71,11 @@ class NanoporeVQModel(nn.Module):
             decay=0.99,                 # EMA 更新 codes
             threshold_ema_dead_code=2,  # 激活低频 codes
             commitment_weight=commitment_weight,  # 控制 z_e 与 e 的对齐强度
-            codebook_diversity_loss_weight = codebook_diversity_loss_weight,
-            orthogonal_reg_weight = orthogonal_reg_weight,                 # in paper, they recommended a value of 10
+            orthogonal_reg_weight = 10,                 # in paper, they recommended a value of 10
             orthogonal_reg_max_codes = 256,             
             # this would randomly sample from the codebook for the orthogonal regularization loss, for limiting memory usage
             orthogonal_reg_active_codes_only = True
             # 每次计算正交损失时，最多使用 256 个码向量；如果当前 batch 激活的唯一码 ≤256，则全部使用；否则随机采样 256 个。
-            # 当 orthogonal_reg_active_codes_only=True 时，正交正则化只作用于当前 batch 中实际被“使用”（即被匹配到）的码本向量，而不是整个码本。
             # set this to True if you have a very large codebook, and would only like to enforce the loss on the activated codes per batch
         )
 
@@ -151,11 +130,7 @@ class NanoporeVQModel(nn.Module):
         z_permuted = z_continuous.permute(0, 2, 1)
 
         # ── Quantize
-        # 在 PyTorch 中，当你对一个 nn.Module 子类的实例（比如 self.vq）使用 函数调用语法：
-        # output = self.vq(input)
-        # 这实际上等价于：
-        # output = self.vq.forward(input)
-        z_quantized_permuted, indices, loss,loss_breakdown = self.vq(z_permuted,return_loss_breakdown=True)
+        z_quantized_permuted, indices, commit_loss = self.vq(z_permuted)
 
         # ── Back to [B, 64, T_enc] for decoder
         z_quantized = z_quantized_permuted.permute(0, 2, 1)
@@ -173,4 +148,4 @@ class NanoporeVQModel(nn.Module):
             pad = target_len - current_len
             recon = F.pad(recon, (0, pad))  # right-pad with zeros
 
-        return recon, indices, loss, loss_breakdown
+        return recon, indices, commit_loss

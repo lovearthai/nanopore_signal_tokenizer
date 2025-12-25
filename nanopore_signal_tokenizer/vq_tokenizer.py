@@ -59,16 +59,16 @@ class VQTokenizer:
 
         # --- Load checkpoint ---
         print(f"📂 Loading checkpoint: {model_ckpt}")
-        ckpt_data = torch.load(model_ckpt, map_location="cpu")
-
-        # --- Infer codebook_size and dim from embed key ---
-        embed_keys = [k for k in ckpt_data.keys() if "_codebook.embed" in k]
+        ckpt_data = torch.load(model_ckpt, map_location="cpu",weights_only=False)
+        # ✅ 正确：从 model_state_dict 中找 codebook
+        state_dict = ckpt_data['model_state_dict']
+        embed_keys = [k for k in state_dict.keys() if "_codebook.embed" in k]
         if not embed_keys:
             raise RuntimeError("No codebook embedding found in checkpoint.")
 
         # Assume single quantizer: key like 'quantizer._codebook.embed'
         embed_key = embed_keys[0]
-        embed_tensor = ckpt_data[embed_key]  # shape: [codebook_size, dim] or [1, codebook_size, dim]
+        embed_tensor = state_dict[embed_key]  # shape: [codebook_size, dim] or [1, codebook_size, dim]
 
         if len(embed_tensor.shape) == 3:
             codebook_size = int(embed_tensor.shape[1])
@@ -84,7 +84,7 @@ class VQTokenizer:
         print(f"🎯 Inferred: codebook_size={codebook_size}, dim={dim}")
 
         # --- Instantiate model ---
-        self.model = NanoporeVQModel(codebook_size=codebook_size)
+        self.model = NanoporeVQModel(codebook_size=codebook_size,codebook_dim=dim)
 
         if not hasattr(self.model, 'cnn_stride'):
             raise AttributeError("Model must define 'cnn_stride' (total downsampling rate).")
@@ -100,7 +100,7 @@ class VQTokenizer:
         self.chunk_size = token_batch_size * self.downsample_rate
 
         # --- Load state dict ---
-        self.model.load_state_dict(ckpt_data)
+        self.model.load_state_dict(state_dict)
         self.model.eval()
         self.model.to(self.device)
 
@@ -132,7 +132,7 @@ class VQTokenizer:
             padded = np.pad(signal, (0, self.chunk_size - L), mode='constant')
             x = torch.from_numpy(padded).float().unsqueeze(0).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                recon,tokens,commit_loss = self.model(x)  # returns [B, T] or [B, T, 1] → squeeze to [T]
+                recon,tokens,loss,loss_breakdown = self.model(x)  # returns [B, T] or [B, T, 1] → squeeze to [T]
             tokens = tokens.squeeze(0).cpu().numpy()
             if tokens.ndim == 2:
                 tokens = tokens[:, 0]  # take first (and only) layer
@@ -153,18 +153,14 @@ class VQTokenizer:
             chunk = signal[start:start + real_len]
             if len(chunk) < self.chunk_size:
                 chunk = np.pad(chunk, (0, self.chunk_size - len(chunk)), mode='constant')
-
             x = torch.from_numpy(chunk).float().unsqueeze(0).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                recon,tokens,commit_loss = self.model(x)
+                recon,tokens,loss,loss_breakdown = self.model(x)
             tokens = tokens.squeeze(0).cpu().numpy()
             if tokens.ndim == 2:
                 tokens = tokens[:, 0]
-
             T_valid = (real_len + self.downsample_rate - 1) // self.downsample_rate
-
             kept_tokens = np.array([], dtype=np.int64)
-
             if chunk_index == 0:
                 end_idx = T_valid - self.margin_stride_count if self.margin_stride_count > 0 else T_valid
                 kept_tokens = tokens[:max(0, end_idx)]
