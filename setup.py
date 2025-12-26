@@ -12,7 +12,7 @@ setup(
         "numpy",
         "scipy",
         "pathos",
-        "faiss-gpu"
+        "faiss"
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

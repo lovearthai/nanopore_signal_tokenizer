@@ -40,7 +40,15 @@ Nanopore 信号语言建模（Signal LM）；
 ```bash
 git clone https://github.com/lovearthai/nanopore_signal_tokenizer.git
 cd nanopore_signal_tokenizer
-pip install -e .
+pip install -e . 
+#如果阿里源报错，切换清华源或官方源 
+pip install -e . \
+  --no-build-isolation \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  --trusted-host pypi.tuna.tsinghua.edu.cn \
+  --trusted-host pypi.org \
+  --trusted-host files.pythonhosted.org
 ```
 
 ##  VQ_tokenizer

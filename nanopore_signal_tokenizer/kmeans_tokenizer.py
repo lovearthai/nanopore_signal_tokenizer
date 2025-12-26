@@ -6,8 +6,6 @@ import json
 from tqdm import tqdm
 from ont_fast5_api.fast5_interface import get_fast5_file
 import numpy as np
-import torch
-import os
 
 class KmeansTokenizer:
     """
@@ -34,8 +32,20 @@ class KmeansTokenizer:
     def _init_worker(self, centroids_path: str):
         centroids = np.load(centroids_path).astype(np.float32)
         d = centroids.shape[1]
-        index = faiss.IndexFlatL2(d)
-        index.add(centroids)
+        if hasattr(faiss, 'StandardGpuResources'):
+        # === GPU 模式 ===
+            print("🚀 Initializing FAISS GPU index...")
+            res = faiss.StandardGpuResources()  # GPU 资源管理器
+            cpu_index = faiss.IndexFlatL2(d)
+            cpu_index.add(centroids) # type: ignore
+            # 将 CPU 索引搬到 GPU（默认 device=0）
+            index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+        else:
+            # === CPU 回退模式 ===
+            print("💻 Using FAISS CPU index...")
+            cpu_index = faiss.IndexFlatL2(d)
+            cpu_index.add(centroids) # type: ignore
+            index = cpu_index
         return index
     
     def _sliding_window_chunks(self, signal, window_size=32, stride=8):
@@ -84,7 +94,7 @@ class KmeansTokenizer:
             X = np.stack(vec_list, axis=0).astype(np.float32)
         except Exception:
             return ""
-        _, I = self.index.search(X, 1)
+        _, I = self.index.search(X, 1) # type: ignore
         cluster_ids = I[:, 0].tolist()
 
         tokens = ''.join(f"<|bwav:{int(cid)}|>" for cid in cluster_ids)
