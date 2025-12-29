@@ -49,6 +49,9 @@ pip install -e . \
   --trusted-host pypi.tuna.tsinghua.edu.cn \
   --trusted-host pypi.org \
   --trusted-host files.pythonhosted.org
+
+pip install vector-quantize-pytorch -i https://pypi.org/simple/
+conda install -c pytorch faiss-gpu  
 ```
 
 ##  VQ_tokenizer

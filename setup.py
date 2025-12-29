@@ -12,7 +12,6 @@ setup(
         "numpy",
         "scipy",
         "pathos",
-        "faiss"
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
