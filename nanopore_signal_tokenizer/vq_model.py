@@ -2,175 +2,303 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vector_quantize_pytorch import VectorQuantize
+from typing import Tuple, Dict
 
 
 class NanoporeVQModel(nn.Module):
     """
     Nanopore VQ Tokenizer for Direct RNA Sequencing (130 bps, 4 kHz)
-    
-    设计目标：
-    - 感受野 ≈ 33 采样点（≈1 个 RNA 碱基）
-    - 总下采样率 = 5×（每碱基 ≈6 个 tokens，高分辨率）
-    - 通道数渐进增长：1 → 16 → 32 → 64
-    - 输出 64 维 latent，直接用于 VQ（避免额外投影）
-    - Decoder 严格对称于 encoder 的下采样操作（仅逆最后一层）
+
+    支持多种 CNN 架构配置，通过 `cnn_type` 切换：
+        - cnn_type=0: 大容量非严格对称模型（默认）
+        - cnn_type=1: 小容量严格对称模型（通道数 1→16→32→64）
+
+    设计目标通用：
+        - 感受野 ≈ 33 采样点（≈1 个 RNA 碱基）
+        - 总下采样率 = 5×（每碱基 ≈6 个 tokens）
+        - 输出 codebook_dim 维 latent，直接用于 VQ
+        - Decoder 在 cnn_type=1 时严格对称于 encoder
 
     适用于：VQ tokenizer + LLM basecalling pipeline
     """
 
-    def __init__(self, codebook_size=8192, codebook_dim= 64, commitment_weight=1.0,orthogonal_reg_weight=1.0,codebook_diversity_loss_weight=1.0):
+    def __init__(
+        self,
+        codebook_size: int = 8192,
+        commitment_weight: float = 1.0,
+        orthogonal_reg_weight: float = 1.0,
+        codebook_diversity_loss_weight: float = 1.0,
+        cnn_type: int = 0,
+    ):
+        """
+        初始化 NanoporeVQModel。
+
+        Args:
+            codebook_size (int): VQ 码本大小。
+            codebook_dim (int): VQ 嵌入维度（即 encoder 最终输出通道数）。
+            commitment_weight (float): VQ commitment loss 权重。
+            orthogonal_reg_weight (float): 正交正则化权重。
+            codebook_diversity_loss_weight (float): 码本多样性损失权重。
+            cnn_type (int): CNN 架构类型。
+                - 0: 默认大模型（1 → 64 → 128 → codebook_dim）
+                - 1: 严格对称小模型（1 → 16 → 32 → 64），此时 codebook_dim 必须为 64
+        """
         super().__init__()
-        self.latent_dim = codebook_dim  # VQ embedding 维度，也是 encoder 最终输出通道数
-        # ======================================================================
-        # ENCODER: 3 层 Conv1D，逐步提取局部 squiggle 特征
-        # 总 stride = 1 * 1 * 5 = 5
-        # 感受野 = 5 → 9 → 33（计算见下方）
-        # ======================================================================
-        encoder_layers = []
 
-        # ── Layer 1: 提取超局部特征（无下采样）
-        #   输入: [B, 1, T]
-        #   kernel=5, stride=1, padding=2 → 输出长度 = T
-        #   通道: 1 → 16
-        encoder_layers.append(nn.Conv1d(1, 16, kernel_size=5, stride=1, padding=2, bias=True))
-        encoder_layers.append(nn.SiLU())          # Swish 的 PyTorch 实现
-        encoder_layers.append(nn.BatchNorm1d(16))
+        # 设置 codebook_dim 根据 cnn_type
+        if cnn_type == 0:
+            codebook_dim = 256
+        elif cnn_type == 1:
+            codebook_dim = 64
+        elif cnn_type == 2:
+            codebook_dim = 512  # 固定为 512，与你提供的结构一致
+        else:
+            raise ValueError(f"Unsupported cnn_type: {cnn_type}. Supported: 0, 1, or 2.")
 
-        # ── Layer 2: 聚合局部上下文（仍无下采样）
-        #   kernel=5, stride=1, padding=2 → 输出长度 = T
-        #   通道: 16 → 32
-        encoder_layers.append(nn.Conv1d(16, 32, kernel_size=5, stride=1, padding=2, bias=True))
-        encoder_layers.append(nn.SiLU())
-        encoder_layers.append(nn.BatchNorm1d(32))
+        self.codebook_dim = codebook_dim
+        self.cnn_type = cnn_type
+        self.latent_dim = codebook_dim
+        self.codebook_size = codebook_size
+        print(f"codebook_dim:{codebook_dim}")
+        # 构建 encoder 和 decoder
+        if cnn_type == 0:
+            self._build_encoder_type0()
+            self._build_decoder_type0()
+            self.cnn_stride = 5   # 总下采样率（仅最后一层 stride=5）
+            self.RF = 33          # 感受野（采样点），对应 ~1 个 RNA 碱基
+        elif cnn_type == 1:
+            self._build_encoder_type1()
+            self._build_decoder_type1()
+            self.cnn_stride = 5   # 总下采样率（仅最后一层 stride=5）
+            self.RF = 33          # 感受野（采样点），对应 ~1 个 RNA 碱基
+        elif cnn_type == 2:
+            self._build_encoder_type2()
+            self._build_decoder_type2()
+            self.cnn_stride = 12  # 1 * 1 * 3 * 2 * 2
+            self.RF = 65  # 
+        else:
+            raise ValueError(f"Unsupported cnn_type: {cnn_type}. Supported: 0 or 1.")
 
-        # ── Layer 3: 关键下采样层（stride=5），同时升维至 latent_dim
-        #   kernel=25, stride=5, padding=12 → 输出长度 ≈ T // 5
-        #   感受野计算:
-        #       RF1 = 1 + (5-1)*1 = 5
-        #       RF2 = 5 + (5-1)*1 = 9
-        #       RF3 = 9 + (25-1)*1 = 33  ← ≈1 个 RNA 碱基 (4000/130 ≈ 31)
-        #   通道: 32 → 64
-        #   注意: 使用 Tanh 而非 SiLU —— 限制输出范围，利于 VQ 稳定训练
-        encoder_layers.append(nn.Conv1d(32, self.latent_dim, kernel_size=25, stride=5, padding=12, bias=True))
-        encoder_layers.append(nn.Tanh())          # 推荐：避免 VQ 输入动态范围过大
-        encoder_layers.append(nn.BatchNorm1d(self.latent_dim))
 
-        self.encoder = nn.Sequential(*encoder_layers)
-        self.cnn_stride = 1 * 1 * 5  # = 5
-        self.margin_stride_count = 12
-        self.RF = 33
         # ======================================================================
         # VECTOR QUANTIZATION (VQ)
-        # 在 64 维空间中离散化连续表示，生成可学习的 codebook
         # ======================================================================
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-        else:
-            rank = 0
-
-        if rank == 0:
-            print("Intialized VectorQuantize with the following hyperparameters:")
-            print(f"  dim: {self.latent_dim}")
-            print(f"  codebook_size: {codebook_size}")
-            print(f"  kmeans_init: True")
-            print(f"  kmeans_iters: 10")
-            print(f"  decay: 0.99")
-            print(f"  threshold_ema_dead_code: 2")
-            print(f"  commitment_weight: {commitment_weight}")
-            print(f"  codebook_diversity_loss_weight: {codebook_diversity_loss_weight}")
-            print(f"  orthogonal_reg_weight: {orthogonal_reg_weight}")
-            print(f"  orthogonal_reg_max_codes: 256")
-            print(f"  orthogonal_reg_active_codes_only: True")
-            print("-" * 60)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         self.vq = VectorQuantize(
             dim=self.latent_dim,
             codebook_size=codebook_size,
-            kmeans_init=True,           # 启动时用 K-Means 初始化 codebook
+            kmeans_init=True,
             kmeans_iters=10,
-            decay=0.99,                 # EMA 更新 codes
-            threshold_ema_dead_code=2,  # 激活低频 codes
-            commitment_weight=commitment_weight,  # 控制 z_e 与 e 的对齐强度
-            codebook_diversity_loss_weight = codebook_diversity_loss_weight,
-            orthogonal_reg_weight = orthogonal_reg_weight,                 # in paper, they recommended a value of 10
-            orthogonal_reg_max_codes = 256,             
-            # this would randomly sample from the codebook for the orthogonal regularization loss, for limiting memory usage
-            orthogonal_reg_active_codes_only = True
-            # 每次计算正交损失时，最多使用 256 个码向量；如果当前 batch 激活的唯一码 ≤256，则全部使用；否则随机采样 256 个。
-            # 当 orthogonal_reg_active_codes_only=True 时，正交正则化只作用于当前 batch 中实际被“使用”（即被匹配到）的码本向量，而不是整个码本。
-            # set this to True if you have a very large codebook, and would only like to enforce the loss on the activated codes per batch
+            decay=0.99,
+            threshold_ema_dead_code=2,
+            commitment_weight=commitment_weight,
+            codebook_diversity_loss_weight=codebook_diversity_loss_weight,
+            orthogonal_reg_weight=orthogonal_reg_weight,
+            orthogonal_reg_max_codes=256,
+            orthogonal_reg_active_codes_only=True,
+        )
+        if rank == 0:
+            self._print_vq_config()
+
+
+    def _print_vq_config(self) -> None:
+        """打印 VQ 配置信息（仅 rank 0）"""
+        print("Intialized VectorQuantize with the following hyperparameters:")
+        print(f"  dim: {self.latent_dim}")
+        print(f"  codebook_size: {self.codebook_size}")
+        print(f"  kmeans_init: True")
+        print(f"  kmeans_iters: 10")
+        print(f"  decay: 0.99")
+        print(f"  threshold_ema_dead_code: 2")
+        print(f"  commitment_weight: {self.vq.commitment_weight}")
+        print(f"  codebook_diversity_loss_weight: {self.vq.codebook_diversity_loss_weight}")
+        print(f"  orthogonal_reg_weight: {self.vq.orthogonal_reg_weight}")
+        print(f"  orthogonal_reg_max_codes: 256")
+        print(f"  orthogonal_reg_active_codes_only: True")
+        print(f"  cnn_type: {self.cnn_type}")
+        print("-" * 60)
+
+    # ────────────────────────────────────────────────
+    # ENCODER BUILDERS
+    # ────────────────────────────────────────────────
+
+    def _build_encoder_type0(self) -> None:
+        """构建 cnn_type=0 的 encoder：1 → 64 → 128 → latent_dim（如 256）"""
+        self.encoder = nn.Sequential(
+            # Layer 1: 超局部特征提取（无下采样）
+            nn.Conv1d(1, 64, kernel_size=5, stride=1, padding=2, bias=False),
+            nn.BatchNorm1d(64),
+            nn.SiLU(),
+
+            # Layer 2: 局部上下文聚合（无下采样）
+            nn.Conv1d(64, 128, kernel_size=5, stride=1, padding=2, bias=False),
+            nn.BatchNorm1d(128),
+            nn.SiLU(),
+
+            # Layer 3: 下采样 + 升维至 latent space（RF=33, stride=5）
+            nn.Conv1d(128, self.latent_dim, kernel_size=25, stride=5, padding=12, bias=False),
+            nn.BatchNorm1d(self.latent_dim),
         )
 
-        # ======================================================================
-        # DECODER: 对称重建原始信号
-        # 只需逆操作 encoder 的最后一层（因为前两层无下采样）
-        # 使用 ConvTranspose1d(kernel=25, stride=5, padding=12) 严格对称
-        # 额外添加 refine 层以消除上采样伪影
-        # ======================================================================
+    def _build_encoder_type1(self) -> None:
+        """构建 cnn_type=1 的 encoder：1 → 16 → 32 → 64（严格对称）"""
+        self.encoder = nn.Sequential(
+            # Layer 1: 1 → 16
+            nn.Conv1d(1, 16, kernel_size=5, stride=1, padding=2, bias=False),
+            nn.BatchNorm1d(16),
+            nn.SiLU(),
+
+            # Layer 2: 16 → 32
+            nn.Conv1d(16, 32, kernel_size=5, stride=1, padding=2, bias=False),
+            nn.BatchNorm1d(32),
+            nn.SiLU(),
+
+            # Layer 3: 32 → 64, stride=5, RF=33
+            nn.Conv1d(32, 64, kernel_size=25, stride=5, padding=12, bias=False),
+            nn.BatchNorm1d(64),
+        )
+    def _build_encoder_type2(self) -> None:
+        """cnn_type=2: 多阶段下采样，总 stride=12，输出通道=512"""
+        self.encoder = nn.Sequential(
+            # Layer 1: 1 → 64, stride=1
+            nn.Conv1d(1, 64, kernel_size=5, stride=1, padding=2, bias=False),
+            nn.BatchNorm1d(64),
+            nn.SiLU(),
+
+            # Layer 2: 64 → 64, stride=1
+            nn.Conv1d(64, 64, kernel_size=5, stride=1, padding=2, bias=False),
+            nn.BatchNorm1d(64),
+            nn.SiLU(),
+
+            # Layer 3: 64 → 128, stride=3
+            nn.Conv1d(64, 128, kernel_size=9, stride=3, padding=4, bias=False),
+            nn.BatchNorm1d(128),
+            nn.SiLU(),
+
+            # Layer 4: 128 → 128, stride=2
+            nn.Conv1d(128, 128, kernel_size=9, stride=2, padding=4, bias=False),
+            nn.BatchNorm1d(128),
+            nn.SiLU(),
+
+            # Layer 5: 128 → 512, stride=2
+            nn.Conv1d(128, self.latent_dim, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.BatchNorm1d(self.latent_dim),
+        )
+    # ────────────────────────────────────────────────
+    # DECODER BUILDERS
+    # ────────────────────────────────────────────────
+
+    def _build_decoder_type0(self) -> None:
+        """构建 cnn_type=0 的 decoder（近似对称，高维 refine）"""
         self.decoder = nn.Sequential(
-            # ── Upsample ×5: 逆操作 encoder Layer 3
-            #    输入: [B, 64, T//5]
-            #    输出: [B, 64, ≈T]
+            # Upsample ×5: 逆操作 encoder 最后一层
             nn.ConvTranspose1d(
                 in_channels=self.latent_dim,
-                out_channels=64,
-                kernel_size=25,         # 与 encoder 最后一层相同
-                stride=5,               # 与 encoder 相同
-                padding=12,             # 与 encoder 相同（保证中心对齐）
-                output_padding=0,       # 若长度偏差 ≤1，靠 final pad 补偿
-                bias=False
+                out_channels=128,
+                kernel_size=25,
+                stride=5,
+                padding=12,
+                output_padding=0,
+                bias=False,
             ),
+            nn.BatchNorm1d(128),
             nn.SiLU(),
-            nn.BatchNorm1d(64),
 
-            # ── Refine Layer: 消除棋盘伪影（checkerboard artifacts）
-            #    这是 ConvTranspose 后的标准做法
-            nn.Conv1d(64, 64, kernel_size=5, padding=2),
+            # Refine layer: 消除棋盘伪影
+            nn.Conv1d(128, 64, kernel_size=5, padding=2,bias=False),
+            nn.BatchNorm1d(64),
             nn.SiLU(),
-            nn.BatchNorm1d(64),
 
-            # ── Final Projection: 回归到原始信号维度
-            nn.Conv1d(64, 1, kernel_size=1)
+            # Final projection to raw signal
+            nn.Conv1d(64, 1, kernel_size=5,padding=2,bias=True),
         )
 
-    def forward(self, x):
+    def _build_decoder_type1(self) -> None:
+        """构建 cnn_type=1 的 decoder（严格对称：64 → 32 → 16 → 1）"""
+        self.decoder = nn.Sequential(
+            # Inverse of encoder Layer 3: 64 → 32
+            nn.ConvTranspose1d(
+                in_channels=64,
+                out_channels=32,
+                kernel_size=25,
+                stride=5,
+                padding=12,
+                output_padding=0,
+                bias=False,
+            ),
+            nn.BatchNorm1d(32),
+            nn.SiLU(),
+
+            # Inverse of encoder Layer 2: 32 → 16
+            nn.Conv1d(32, 16, kernel_size=5, padding=2,bias=False),
+            nn.BatchNorm1d(16),
+            nn.SiLU(),
+
+            # Inverse of encoder Layer 1: 16 → 1
+            nn.Conv1d(16, 1, kernel_size=5, padding=2,bias=True)
+        )
+    def _build_decoder_type2(self) -> None:
+        """严格对称 decoder: 512 → 128 → 128 → 64 → 64 → 1，上采样顺序与 encoder 下采样逆序对应"""
+        self.decoder = nn.Sequential(
+            # Inverse of encoder Layer 5: 512 → 128, upsample ×2
+            nn.ConvTranspose1d(512, 128, kernel_size=5, stride=2, padding=2, output_padding=0,bias=False),
+            nn.BatchNorm1d(128),
+            nn.SiLU(),
+
+            # Inverse of encoder Layer 4: 128 → 128, upsample ×2
+            nn.ConvTranspose1d(128, 128, kernel_size=9, stride=2, padding=4, output_padding=0,bias=False),
+            nn.BatchNorm1d(128),
+            nn.SiLU(),
+
+            # Inverse of encoder Layer 3: 128 → 64, upsample ×3
+            nn.ConvTranspose1d(128, 64, kernel_size=9, stride=3, padding=4, output_padding=0,bias=False),
+            nn.BatchNorm1d(64),
+            nn.SiLU(),
+
+            # Inverse of encoder Layer 2: 64 → 64
+            nn.Conv1d(64, 64, kernel_size=5, padding=2,bias=False),
+            nn.BatchNorm1d(64),
+            nn.SiLU(),
+
+            # Inverse of encoder Layer 1: 64 → 1
+            nn.Conv1d(64, 1, kernel_size=5,padding=2,bias=True)
+        )
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
         """
+        前向传播。
+
         Args:
-            x: [B, 1, T] —— 标准化后的原始电流信号（pA）
+            x (torch.Tensor): 输入信号，形状 [B, 1, T]
 
         Returns:
-            recon:     [B, 1, T] —— 重建信号
-            indices:   [B, T//5] —— VQ 离散 token 序列（用于 LLM）
-            commit_loss: scalar —— VQ commitment loss
+            recon (torch.Tensor): 重建信号，[B, 1, T]
+            indices (torch.Tensor): VQ 离散 token，[B, T//5]
+            loss (torch.Tensor): VQ 总损失（标量）
+            loss_breakdown (dict): 损失分项（commitment, diversity, ortho...）
         """
-        # ── Encode to continuous latent
-        #    [B, 1, T] → [B, 64, T_enc], where T_enc = T // 5
+        # Encode: [B, 1, T] → [B, C, T//5]
         z_continuous = self.encoder(x)
 
-        # ── Permute for VQ: vector_quantize_pytorch expects [B, N, D]
-        #    [B, 64, T_enc] → [B, T_enc, 64]
+        # Permute for VQ: [B, C, N] → [B, N, C]
         z_permuted = z_continuous.permute(0, 2, 1)
 
-        # ── Quantize
-        # 在 PyTorch 中，当你对一个 nn.Module 子类的实例（比如 self.vq）使用 函数调用语法：
-        # output = self.vq(input)
-        # 这实际上等价于：
-        # output = self.vq.forward(input)
-        z_quantized_permuted, indices, loss,loss_breakdown = self.vq(z_permuted,return_loss_breakdown=True)
+        # Quantize
+        z_quantized_permuted, indices, loss, loss_breakdown = self.vq(
+            z_permuted, return_loss_breakdown=True
+        )
 
-        # ── Back to [B, 64, T_enc] for decoder
+        # Back to [B, C, N] for decoder
         z_quantized = z_quantized_permuted.permute(0, 2, 1)
 
-        # ── Decode to reconstructed signal
-        recon = self.decoder(z_quantized)  # [B, 1, T_rec]
+        # Decode
+        recon = self.decoder(z_quantized)
 
-        # ── Length alignment: ensure recon length == input length
-        target_len = x.shape[2]
-        current_len = recon.shape[2]
-
+        # Length alignment: ensure recon length == input length
+        target_len = x.shape[-1]
+        current_len = recon.shape[-1]
         if current_len > target_len:
-            recon = recon[:, :, :target_len]
+            recon = recon[..., :target_len]
         elif current_len < target_len:
-            pad = target_len - current_len
-            recon = F.pad(recon, (0, pad))  # right-pad with zeros
+            recon = F.pad(recon, (0, target_len - current_len))
 
         return recon, indices, loss, loss_breakdown

@@ -24,6 +24,177 @@ def nanopore_normalize(norm_signal):
     norm_signal, _, _ = med_mad_norm(norm_signal)
     return norm_signal
 
+from scipy.ndimage import median_filter
+# MAD 对“平坦区域”过于敏感
+# 在低噪声、高重复性区域（如 homopolymer 区域），信号变化极小，MAD 自然趋近于 0。
+# 但 Nanopore 信号即使在“平坦”区也有微小波动，若采样精度高（float32），MAD 可能远小于 1e-3。
+# 改进建议（工业级实践）
+# 方案 1：提高 min_mad 的下限（最简单有效
+def nanopore_normalize_local(signal, window_size=2000, factor=1.4826, min_mad=1.0):
+    if window_size % 2 == 0:
+        window_size += 1
+    local_med = median_filter(signal, size=window_size, mode='reflect')
+    abs_dev = np.abs(signal - local_med)
+    local_mad = median_filter(abs_dev, size=window_size, mode='reflect')
+    local_mad = factor * local_mad
+    local_mad = np.clip(local_mad, a_min=min_mad, a_max=None)
+    return (signal - local_med) / local_mad
+
+
+import numpy as np
+from scipy.ndimage import median_filter
+
+def nanopore_normalize_hybrid_v1(signal, window_size=2000, mad_factor=1.4826, min_mad=1.0):
+    """
+    Hybrid normalization:
+      - Local median (sliding window) to remove baseline drift
+      - Global MAD (robust scale) for stable normalization
+    Parameters:
+        signal: 1D array
+        window_size: size of median filter window (for local med)
+        mad_factor: 1.4826 for Gaussian consistency
+        min_mad: avoid division by near-zero
+    Returns:
+        normalized signal
+    """
+    # Compute global MAD (robust scale estimate)
+    global_med = np.median(signal)
+    global_mad = mad_factor * np.median(np.abs(signal - global_med))
+    global_mad = max(global_mad, min_mad)  # clamp to min_mad
+    # Compute local median (to track baseline drift)
+    if window_size % 2 == 0:
+        window_size += 1
+    local_med = median_filter(signal, size=window_size, mode='reflect')
+    # Normalize
+    normalized = (signal - local_med) / global_mad
+    return normalized.astype(np.float32),global_mad
+
+def nanopore_normalize_hybrid(signal, window_size=2000, mad_factor=1.4826, min_mad=1.0):
+    """
+    Hybrid normalization: remove baseline drift with local median, scale with global MAD of residuals.
+    """
+    # Ensure odd window size for median filter
+    if window_size % 2 == 0:
+        window_size += 1
+    # Local median to track baseline drift
+    # 下面两句代码相当于高通滤波
+    local_med = median_filter(signal, size=window_size, mode='reflect')
+    # Residual after removing baseline
+    residual = signal - local_med
+    # Global MAD on residuals (robust scale estimate)
+    global_mad = mad_factor * np.median(np.abs(residual))
+    global_mad = max(global_mad, min_mad)
+    # Normalize by global MAD
+    normalized = residual / global_mad
+    return normalized.astype(np.float32), global_mad
+
+import numpy as np
+
+#明白了！我们去掉 search_full 参数，统一使用一个 search_range（整数）参数，表示：
+#对每个异常点，只在左右各 search_range 个采样点内寻找合法值。
+#如果在这个窗口内：
+#左右都找到 → 用均值；
+#只有一侧找到 → 用该侧值；
+#都没找到 → 用 min_value 或 max_value 替代
+def nanopore_filter_noise_bak(signal, min_value, max_value, search_range=10):
+    """
+    Replace outliers in signal using local neighborhood within `search_range`.
+    
+    For each point outside [min_value, max_value]:
+      - Search up to `search_range` points to the left and right for valid values.
+      - If both sides have valid neighbors: use their mean.
+      - If only one side has: use that value.
+      - If neither side has: clamp to min_value or max_value.
+    
+    Parameters:
+        signal (np.ndarray): 1D input signal.
+        min_value (float): Lower bound of valid range.
+        max_value (float): Upper bound of valid range.
+        search_range (int): Number of points to search left/right (default=10).
+    
+    Returns:
+        np.ndarray: Cleaned signal.
+    """
+    signal = np.asarray(signal, dtype=np.float32)
+    cleaned = signal.copy()
+    n = len(signal)
+
+    # Valid mask: True where signal is within bounds
+    valid_mask = (signal >= min_value) & (signal <= max_value)
+
+    for i in range(n):
+        if valid_mask[i]:
+            continue  # Skip valid points
+
+        original_val = signal[i]
+
+        # --- Search left: from i-1 down to max(0, i - search_range) ---
+        left_val = None
+        start_left = max(0, i - search_range)
+        for j in range(i - 1, start_left - 1, -1):  # inclusive of start_left
+            if valid_mask[j]:
+                left_val = signal[j]
+                break
+
+        # --- Search right: from i+1 up to min(n-1, i + search_range) ---
+        right_val = None
+        end_right = min(n - 1, i + search_range)
+        for j in range(i + 1, end_right + 1):  # inclusive of end_right
+            if valid_mask[j]:
+                right_val = signal[j]
+                break
+
+        # --- Decide replacement ---
+        if left_val is not None and right_val is not None:
+            cleaned[i] = (left_val + right_val) / 2.0
+        elif left_val is not None:
+            cleaned[i] = left_val
+        elif right_val is not None:
+            cleaned[i] = right_val
+        else:
+            # No valid neighbor in search window → clamp
+            if original_val > max_value:
+                cleaned[i] = max_value
+            else:
+                cleaned[i] = min_value
+
+    return cleaned
+
+import numpy as np
+
+def nanopore_filter_noise(signal, min_value, max_value):
+    """
+    Fast version: only process outlier indices in increasing order.
+    Uses the fact that cleaned[i] depends only on cleaned[i-1],
+    and i-1 is always processed before i if we go left-to-right.
+    """
+    signal = np.asarray(signal, dtype=np.float32)
+    cleaned = signal.copy()
+    n = cleaned.size
+
+    if n == 0:
+        return cleaned
+
+    # Find all outlier indices
+    valid_mask = (cleaned >= min_value) & (cleaned <= max_value)
+    outlier_indices = np.where(~valid_mask)[0]
+
+    if outlier_indices.size == 0:
+        return cleaned
+    # Process outliers from left to right (they are already sorted)
+    for i in outlier_indices:
+        if i < 1:
+            # First point: clamp
+            if cleaned[0] > max_value:
+                cleaned[0] = max_value
+            else:
+                cleaned[0] = min_value
+        else:
+            # Use immediate left neighbor (which is already final)
+            cleaned[i] = cleaned[i - 1]
+    return cleaned
+
+
 from scipy import signal
 import numpy as np
 
@@ -51,6 +222,8 @@ def nanopore_filter(signal_data, fs=5000, cutoff=1000, order=6):
     filtered_signal = signal.filtfilt(b, a, signal_data)
      # ✅ 关键修复：确保返回 C-contiguous 的副本，避免负 stride
     return np.ascontiguousarray(filtered_signal, dtype=np.float32)
+
+
 
 
 from scipy.signal import medfilt

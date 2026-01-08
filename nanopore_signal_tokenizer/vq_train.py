@@ -17,6 +17,7 @@ from .dwa import DynamicWeightAverager
 # ========== 评估函数（仅在 do_evaluate=True 时调用）==========
 import json
 from pprint import pformat
+from scipy.stats import entropy
 
 # ====== 打印所有训练参数 ======
 def print_training_args(**kwargs):
@@ -37,6 +38,7 @@ def save_full_checkpoint(
     epoch: int,
     spoch: int,
     global_step: int,
+    cnn_type:int,
     rank: int
 ):
     if rank != 0:
@@ -46,6 +48,7 @@ def save_full_checkpoint(
         'epoch': epoch,
         'spoch': spoch,
         'global_step': global_step,
+        'cnn_type':cnn_type,
         'model_state_dict': model.module.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'rng_state': torch.get_rng_state(),
@@ -153,7 +156,6 @@ def vq_train(
     lr: float = 1e-4,
     num_epochs: int = 10,
     codebook_size: int = 8192,
-    codebook_dim: int = 512,
     chunk_size: int = 12000,
     num_workers: int = 8,
     update_loss_weight_every: int = 10,
@@ -175,8 +177,9 @@ def vq_train(
     warmup_end_factor: float = 1.0,             # warmup 结束 lr = lr * end_factor
     main_scheduler_end_factor: float = 1e-6,    # 主调度器最终 lr = lr * end_factor（仅 linear 用）
     save_checkpoint_every_spoch: int = 1000,    # 每多少个update_loss_weight_every进行一次检查点保存
-    evaluate_every_spoch: int = 1000,           # 每多少个update_loss_weight_every进行一次evaluate
-    checkpoint_path : str = None
+    evaluate_every_spoch: int = 100,           # 每多少个update_loss_weight_every进行一次evaluate
+    checkpoint_path : str = None,
+    cnn_type: int = 0
 ):
     # 调用：传入所有参数
     print_training_args(
@@ -186,7 +189,6 @@ def vq_train(
         lr=lr,
         num_epochs=num_epochs,
         codebook_size=codebook_size,
-        codebook_dim=codebook_dim,
         chunk_size=chunk_size,
         num_workers=num_workers,
         update_loss_weight_every=update_loss_weight_every,
@@ -243,7 +245,6 @@ def vq_train(
                "lr": lr,
                "num_epochs": num_epochs,
                "codebook_size": codebook_size,
-               "codebook_dim": codebook_dim,
                "chunk_size": chunk_size,
                "update_loss_weight_every": update_loss_weight_every,
                "commitment_weight": commitment_weight,
@@ -262,7 +263,7 @@ def vq_train(
         print(f"💾 Model will be saved to: {output_model_path}")
         print(f"⚙️  Hyperparameters: "
               f"batch_size={batch_size}, lr={lr}, epochs={num_epochs}, "
-              f"codebook_size={codebook_size}, codebook_dim={codebook_dim}, chunk_size={chunk_size}, "
+              f"codebook_size={codebook_size}, chunk_size={chunk_size}, "
               f"do_evaluate={do_evaluate}, save_checkpoint_every_spoch={save_checkpoint_every_spoch}")
 
         # ✅ 初始化 CSV 文件（仅 rank 0）
@@ -321,10 +322,115 @@ def vq_train(
         model.train()
         return usage_ratio, total_tokens
 
+    def evaluate_codebook_metrics():
+        if val_loader is None:
+            return 0.0, 0, 0.0, 0.0  # usage_ratio, total_tokens, top1_ratio, top10_ratio
+
+        model.eval()
+        used_codes = set()
+        token_counts = np.zeros(codebook_size, dtype=np.int64)
+        total_tokens = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                x = batch.to(device)
+                _, indices, _, _ = model.module(x)
+                indices = indices.cpu().numpy().flatten()
+                used_codes.update(indices.tolist())
+                total_tokens += indices.size
+                # 累加频次
+                for idx in indices:
+                    token_counts[idx] += 1
+
+        usage_ratio = len(used_codes) / codebook_size
+
+        if total_tokens == 0:
+            top1_ratio, top10_ratio = 0.0, 0.0
+        else:
+            sorted_counts = np.sort(token_counts)[::-1]
+            top1_ratio = float(sorted_counts[0] / total_tokens)
+            top3_ratio = float(sorted_counts[3] / total_tokens)
+            top5_ratio = float(sorted_counts[5] / total_tokens)
+            top7_ratio = float(sorted_counts[7] / total_tokens)
+            top9_ratio = float(sorted_counts[9] / total_tokens)
+            top10_ratio = float(sorted_counts[:min(10, codebook_size)].sum() / total_tokens)
+
+        model.train()
+        return usage_ratio, total_tokens, top1_ratio, top3_ratio,top5_ratio,top7_ratio,top9_ratio,top10_ratio
+
+    def evaluate_codebook_metrics():
+        if val_loader is None:
+            # 返回原有 + entropy, max_entropy（设为0）
+            return 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        model.eval()
+        used_codes = set()
+        token_counts = np.zeros(codebook_size, dtype=np.int64)
+        total_tokens = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                x = batch.to(device)
+                _, indices, _, _ = model.module(x)
+                indices = indices.cpu().numpy().flatten()
+                used_codes.update(indices.tolist())
+                total_tokens += indices.size
+                for idx in indices:
+                    token_counts[idx] += 1
+
+        usage_ratio = len(used_codes) / codebook_size
+
+        # 初始化比率
+        top1_ratio = top3_ratio = top5_ratio = top7_ratio = top9_ratio = top10_ratio = 0.0
+        entropy = 0.0
+        max_entropy = np.log2(codebook_size)  # 理论最大熵（均匀分布）
+
+        if total_tokens > 0:
+            sorted_counts = np.sort(token_counts)[::-1]
+            
+            # Top-k ratios
+            top1_ratio = float(sorted_counts[0] / total_tokens)
+            if len(sorted_counts) > 3:
+                top3_ratio = float(sorted_counts[3] / total_tokens)
+            if len(sorted_counts) > 5:
+                top5_ratio = float(sorted_counts[5] / total_tokens)
+            if len(sorted_counts) > 7:
+                top7_ratio = float(sorted_counts[7] / total_tokens)
+            if len(sorted_counts) > 9:
+                top9_ratio = float(sorted_counts[9] / total_tokens)
+            top10_ratio = float(sorted_counts[:min(10, codebook_size)].sum() / total_tokens)
+
+            # === 新增：计算香农熵 ===
+            # 转换为概率分布
+            prob = token_counts / total_tokens  # shape: (codebook_size,)
+            # 只保留非零概率（避免 log(0)）
+            nonzero_prob = prob[prob > 0]
+            if nonzero_prob.size > 0:
+                entropy = -np.sum(nonzero_prob * np.log2(nonzero_prob))
+            else:
+                entropy = 0.0
+        else:
+            entropy = 0.0
+
+        model.train()
+        
+        # 返回顺序：
+        # usage_ratio, total_tokens,
+        # top1, top3, top5, top7, top9, top10,
+        # entropy, max_entropy
+        return (
+            usage_ratio, total_tokens,
+            top1_ratio, top3_ratio, top5_ratio, top7_ratio, top9_ratio, top10_ratio,
+            entropy, max_entropy
+        )
+
+
     if do_evaluate and rank == 0:  # ⭐ 只在 rank 0 创建 val_loader（其他 rank 不需要）
         actual_val_size = int(val_ratio *len(dataset))
         if actual_val_size < 1:
             actual_val_size = 1
+        # 🔒 固定验证集的随机性（关键！）
+        np.random.seed(42)  # 或任何你喜欢的整数
         indices = np.random.choice(len(dataset), size=actual_val_size, replace=False)
         val_subset = torch.utils.data.Subset(dataset, indices)  # ← 复用 dataset
         val_loader = DataLoader(
@@ -335,13 +441,20 @@ def vq_train(
             pin_memory=True
         )
     # ========== 模型与优化器 ==========
+    # 1. 创建模型（不加载）
     model = NanoporeVQModel(
             codebook_size=codebook_size, 
-            codebook_dim=codebook_dim, 
             commitment_weight=commitment_weight,
             codebook_diversity_loss_weight=codebook_diversity_loss_weight,
-            orthogonal_reg_weight=orthogonal_reg_weight
+            orthogonal_reg_weight=orthogonal_reg_weight,
+            cnn_type=cnn_type
             ).to(device)
+    #model = DDP(model, device_ids=[local_device_id],find_unused_parameters=True )
+    # 2. 先 wrap 成 DDP（关键！）一定要在加载检查点之前做DDP
+    model = DDP(model, device_ids=[local_device_id])
+
+    # 3. 再创建 optimizer（基于 DDP 模型的参数）
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
 
@@ -520,13 +633,18 @@ def vq_train(
         if rank == 0 and checkpoint_path is not None:
             print("⚠️  Invalid checkpoint_path (empty or not a string). Ignoring.")
 
-    #model = DDP(model, device_ids=[local_device_id],find_unused_parameters=True )
-    model = DDP(model, device_ids=[local_device_id])
-
    
     # ========== 训练循环 ==========
     model.train()
     codebook_usage = 0.0
+    codebook_top1_ratio = 0.0
+    codebook_top3_ratio = 0.0
+    codebook_top5_ratio = 0.0
+    codebook_top7_ratio = 0.0
+    codebook_top9_ratio = 0.0
+    codebook_top10_ratio = 0.0
+    codebook_entropy = 0.0
+    codebook_max_entropy = 0.0
     total_steps = len(dataloader)*num_epochs
     epoch_total_steps = len(dataloader)  # 当前 epoch 的本地 step 数（每个 rank 相同）
     # 👇 新增：缓存权重（初始值可设为 1.0）
@@ -570,6 +688,8 @@ def vq_train(
             #    comit_loss * (commitment_weight+epoch) + 
             #    ortho_loss * orthogonal_reg_weight + 
             #    diver_loss * codebook_diversity_loss_weight)
+
+
             total_loss = (recon_loss + 
                 comit_loss * (commitment_weight) )
             
@@ -662,11 +782,20 @@ def vq_train(
                         "train/ortho_loss": global_avg_ortho,
                         "train/diver_loss": global_avg_diver,
                         "train/total_loss": global_avg_total,
-                        "train/codebook_usage": codebook_usage,
+                        "codebook/usage": codebook_usage,
+                        "codebook/top1_ratio": codebook_top1_ratio,
+                        "codebook/top3_ratio": codebook_top3_ratio,
+                        "codebook/top5_ratio": codebook_top5_ratio,
+                        "codebook/top7_ratio": codebook_top7_ratio,
+                        "codebook/top9_ratio": codebook_top9_ratio,
+                        "codebook/top10_ratio": codebook_top10_ratio,
+                        "codebook/entropy": codebook_entropy,
+                        "codebook/max_entropy": codebook_max_entropy,
                         "weights/recon": wv_recon,
                         "weights/comit": wv_comit,
                         "weights/ortho": wv_ortho,
                         "weights/diver": wv_diver,
+                        "weights/commitment_weight": commitment_weight,
                         "epoch": epoch + 1,
                         "learning_rate": current_lr,  # 如果使用 scheduler，可动态获取
                     }
@@ -674,7 +803,7 @@ def vq_train(
                         wandb.log(log_dict, step=global_step)
 
                 if rank == 0 and (spoch + 1)% evaluate_every_spoch == 0 and spoch < total_spochs:
-                    codebook_usage, total_tokens = evaluate_codebook_usage()
+                    codebook_usage, total_tokens,codebook_top1_ratio,codebook_top3_ratio, codebook_top5_ratio, codebook_top7_ratio, codebook_top9_ratio,codebook_top10_ratio,codebook_entropy, codebook_max_entropy = evaluate_codebook_metrics()
                     print(
                         f"Spoch {spoch+1} - "
                         f"Codebook Usage: {codebook_usage:.2%} "
@@ -690,6 +819,7 @@ def vq_train(
                         epoch=epoch,
                         spoch=spoch,
                         global_step=global_step,
+                        cnn_type=cnn_type,
                         rank=rank
                     )
                     print(f"✅ Checkpoint saved to {checkpoint_path}")
@@ -703,7 +833,7 @@ def vq_train(
             scheduler=scheduler,
             epoch=num_epochs - 1,
             spoch=spoch,
-            global_step=final_step,
+            global_step=global_step,
             rank=rank
         )
         print(f"✅ Final model saved to {output_model_path}")

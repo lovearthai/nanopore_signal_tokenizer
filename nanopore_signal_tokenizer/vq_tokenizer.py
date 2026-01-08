@@ -60,6 +60,14 @@ class VQTokenizer:
         # --- Load checkpoint ---
         print(f"📂 Loading checkpoint: {model_ckpt}")
         ckpt_data = torch.load(model_ckpt, map_location="cpu",weights_only=False)
+
+        # ✅ 1. 从 checkpoint 中读取 cnn_type（关键！）
+        if 'cnn_type' not in ckpt_data:
+            print("Checkpoint does not contain 'cnn_type'. forced to 0")
+            cnn_type = 0
+        else:
+            cnn_type = ckpt_data['cnn_type']
+
         # ✅ 正确：从 model_state_dict 中找 codebook
         state_dict = ckpt_data['model_state_dict']
         embed_keys = [k for k in state_dict.keys() if "_codebook.embed" in k]
@@ -81,10 +89,10 @@ class VQTokenizer:
 
         self.codebook_size = codebook_size
         self.dim = dim
-        print(f"🎯 Inferred: codebook_size={codebook_size}, dim={dim}")
+        print(f"🎯 Inferred: codebook_size={codebook_size}, dim={dim}, cnn_type={cnn_type}")
 
         # --- Instantiate model ---
-        self.model = NanoporeVQModel(codebook_size=codebook_size,codebook_dim=dim)
+        self.model = NanoporeVQModel(codebook_size=codebook_size,cnn_type=cnn_type)
 
         if not hasattr(self.model, 'cnn_stride'):
             raise AttributeError("Model must define 'cnn_stride' (total downsampling rate).")
@@ -227,7 +235,7 @@ class VQTokenizer:
             return []
 
     def tokenize_fast5(self, fast5_path: str, output_path: str,do_normalize: bool = True,medf: int = 0, lpf: int = 0):
-        print(f"✅ Processing {fast5_path}")
+        print(f"✅ Processing {fast5_path} with medf:{medf} lpf:{lpf}")
         results = []
         with get_fast5_file(fast5_path, mode="r") as f5:
             for read in tqdm(f5.get_reads(), desc=os.path.basename(fast5_path)):
