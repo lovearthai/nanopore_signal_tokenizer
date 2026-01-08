@@ -8,7 +8,7 @@ import json  # 【新增】用于保存全局汇总报告
 import numpy as np
 import glob
 from ont_fast5_api.fast5_interface import get_fast5_file
-from .nanopore import nanopore_normalize,nanopore_normalize_local,nanopore_normalize_hybrid,nanopore_filter_noise, nanopore_filter
+from .nanopore import nanopore_normalize,nanopore_repair_normal,nanopore_remove_spikes,nanopore_normalize_hybrid,nanopore_repair_error, nanopore_filter
 from scipy.signal import medfilt
 from pathos.multiprocessing import ProcessPool
 from multiprocessing import cpu_count
@@ -215,52 +215,28 @@ class Fast5Dir:
                         local_stats["reads_skipped"]["signal_extraction_failed"] += 1
                         continue
 
-                    # 使用 nanopore_filter_noise 过滤极端异常值
-                    if np.any(signal_raw < signal_min_value) or np.any(signal_raw > signal_max_value):
-                        signal_clr = nanopore_filter_noise(signal_raw, signal_min_value, signal_max_value)
-                        # 再次检查是否仍有越界（理论上应已修复，但保险起见）
-                        if np.any(signal_clr < signal_min_value) or np.any(signal_clr > signal_max_value):
-                            print(f"⚠️ Read {read.read_id} still out of raw range after filtering, skipped.")
-                            local_stats["reads_skipped"]["signal_out_of_raw_range"] += 1
-                            continue
-                    else:
-                        signal_clr = signal_raw
-
-                    # 应用中值滤波（注意：此处原代码已强制开启，但参数控制仍保留）
-                    signal_med = medfilt(signal_clr, kernel_size=5).astype(np.float32)
-
-                    # 检查中值滤波后是否越界（罕见但可能发生）
-                    if np.any(signal_med < signal_min_value) or np.any(signal_med > signal_max_value):
-                        actual_min = signal_med.min()
-                        actual_max = signal_med.max()
-                        print(f"⚠️ Ignored read {fast5_path} {read.read_id} due to out-of-range signal values after median filter. "
-                              f"Actual range: [{actual_min:.3f}, {actual_max:.3f}], "
-                              f"Allowed: [{signal_min_value}, {signal_max_value}]")
-                        
-                        # 🔁【恢复】打印异常点上下文（来自 fast5.bak.py）
-                        outlier_mask = (signal_med < signal_min_value) | (signal_med > signal_max_value)
-                        outlier_indices = np.where(outlier_mask)[0]
-                        max_print = 3
-                        for i, idx in enumerate(outlier_indices[:max_print]):
-                            start = max(0, idx - 3)
-                            end = min(len(signal_med), idx + 4)
-                            context = signal_med[start:end]
-                            positions = np.arange(start, end)
-                            print(f"  → Outlier #{i+1} at index {idx}: value = {signal_med[idx]:.3f}")
-                            print(f"    Context ({start}–{end-1}): {context.tolist()}")
-                        if len(outlier_indices) > max_print:
-                            print(f"  → ... and {len(outlier_indices) - max_print} more outliers.")
-                        
-                        local_stats["reads_skipped"]["signal_out_of_med_range"] += 1
+                    # 使用 nanopore_repair_error 过滤极端异常值
+                    signal_clr = nanopore_repair_error(signal_raw, signal_min_value, signal_max_value)
+                    # 再次检查是否仍有越界（理论上应已修复，但保险起见）
+                    if np.any(signal_clr < signal_min_value) or np.any(signal_clr > signal_max_value):
+                        print(f"⚠️ Read {read.read_id} still out of raw range after filtering, skipped.")
+                        local_stats["reads_skipped"]["signal_out_of_raw_range"] += 1
                         continue
+                    # 把nanopore_repair_error没有修复的包含在[signal_min_value,signal_max_value]范围内的数据给修复掉
+                    signal_nos = nanopore_remove_spikes(signal_clr, window_size=window_size, spike_threshold=5.0)
+                    
+                    # 因为repair里有abs(raw-med)这一步，所以必须在这步前修复数据，把极端大的值给干掉,也就是必须repair
+                    signal_nom, global_mad = nanopore_normalize_hybrid(signal_nos, window_size=window_size)
 
-                    if do_normalize:
-                        signal, global_mad = nanopore_normalize_hybrid(signal_med, window_size=5000)
-                    else:
-                        signal = signal_med
+                    #signal_nom = nanopore_repair_normal(signal_nom, NORM_SIG_MIN, NORM_SIG_MAX,window_size=33)
+                    # 应用中值滤波（注意：此处原代码已强制开启，但参数控制仍保留）
+                    signal_med = medfilt(signal_nom, kernel_size=5).astype(np.float32)
+                    
+                    signal = signal_med
+                    signal_chk = signal_nom
 
                     # 检查归一化后是否在允许范围内
-                    if np.any(signal < NORM_SIG_MIN) or np.any(signal > NORM_SIG_MAX):
+                    if np.any(signal_chk < NORM_SIG_MIN) or np.any(signal_chk > NORM_SIG_MAX):
                         actual_min = signal.min()
                         actual_max = signal.max()
                         print(f"⚠️ Ignored read {fast5_path} {read.read_id} due to out-of-range signal values after normalization. "
@@ -268,25 +244,40 @@ class Fast5Dir:
                               f"Allowed: [{NORM_SIG_MIN}, {NORM_SIG_MAX}]")
 
                         # 🔁【恢复】多阶段上下文打印（来自 fast5.bak.py）
-                        outlier_mask = (signal < NORM_SIG_MIN) | (signal > NORM_SIG_MAX)
+                        outlier_mask = (signal_chk < NORM_SIG_MIN) | (signal_chk > NORM_SIG_MAX)
                         outlier_indices = np.where(outlier_mask)[0]
+                        # === 新增：过滤掉与前一个异常点距离小于5的点 ===
+                        print_half_window_size = 5
+                        if outlier_indices.size > 0:
+                            keep = [True]  # 第一个点总是保留
+                            last_kept = outlier_indices[0]
+                            for idx in outlier_indices[1:]:
+                                if idx - last_kept >= print_half_window_size:
+                                    keep.append(True)
+                                    last_kept = idx
+                                else:
+                                    keep.append(False)
+                            outlier_indices = outlier_indices[keep]
                         max_print = 5
                         for i, idx in enumerate(outlier_indices[:max_print]):
-                            start = max(0, idx - 5)
-                            end = min(len(signal), idx + 6)
+                            start = max(0, idx - print_half_window_size)
+                            end = min(len(signal_chk), idx + print_half_window_size)
                             context = signal[start:end]
                             context_raw = signal_raw[start:end]
                             context_clr = signal_clr[start:end]
+                            context_nos = signal_nos[start:end]
+                            context_nom = signal_nom[start:end]
                             context_med = signal_med[start:end]
                             print(f"  → Outlier #{i+1} at index {idx}: value = {signal[idx]:.3f}")
                             print(f"    Raw ({start}–{end-1}): {[f'{x:.3f}' for x in context_raw]}")
                             print(f"    Clr ({start}–{end-1}): {[f'{x:.3f}' for x in context_clr]}")
+                            print(f"    Nom ({start}–{end-1}): {[f'{x:.3f}' for x in context_nom]}")
+                            print(f"    Nos ({start}–{end-1}): {[f'{x:.3f}' for x in context_nos]}")
                             print(f"    Med ({start}–{end-1}): {[f'{x:.3f}' for x in context_med]}")
-                            print(f"    Nor ({start}–{end-1}): {[f'{x:.3f}' for x in context]}")
-
                         if len(outlier_indices) > max_print:
                             print(f"  → ... and {len(outlier_indices) - max_print} more outliers.")
 
+                    if np.any(signal_nom < NORM_SIG_MIN) or np.any(signal_nom > NORM_SIG_MAX):
                         local_stats["reads_skipped"]["signal_out_of_norm_range"] += 1
                         continue
 

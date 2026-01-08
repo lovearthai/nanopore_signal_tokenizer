@@ -89,6 +89,38 @@ def nanopore_normalize_hybrid(signal, window_size=2000, mad_factor=1.4826, min_m
     return normalized.astype(np.float32), global_mad
 
 import numpy as np
+from scipy.ndimage import median_filter
+# 这个函数将会遍历输入的信号数组，并对每个小于 min_value 或大于 max_value 的值进行修复。修复的方法是使用该点附近（包括自身）共 window_size 个点计算出的中位数来替换原始值。注意，对于数组边界处的点，我们只能使用到边界的那些点来计算中位数。
+def nanopore_repair_normal(signal, min_value, max_value, window_size):
+    """
+    高效修复超出 [min_value, max_value] 范围的信号点：
+    将异常点替换为以该点为中心、长度为 window_size 的窗口中位数。
+
+    Parameters:
+        signal (np.ndarray): 1D 信号数组
+        min_value (float): 下界阈值
+        max_value (float): 上界阈值
+        window_size (int): 滑动窗口大小（必须为奇数）
+
+    Returns:
+        np.ndarray: 修复后的信号
+    """
+    if window_size % 2 == 0:
+        raise ValueError("window_size 必须为奇数")
+
+    signal = np.asarray(signal, dtype=np.float32)
+
+    # 创建异常点掩码：True 表示需要修复
+    mask = (signal < min_value) | (signal > max_value)
+
+    if not np.any(mask):
+        return signal.copy()  # 无异常，直接返回
+    # 计算整个信号的滑动中位数（含边界自动处理）
+    median_filtered = median_filter(signal, size=window_size, mode='nearest')
+    # 仅将异常点替换为中位数，正常点保留原值
+    repaired = np.where(mask, median_filtered, signal)
+    return repaired
+import numpy as np
 
 #明白了！我们去掉 search_full 参数，统一使用一个 search_range（整数）参数，表示：
 #对每个异常点，只在左右各 search_range 个采样点内寻找合法值。
@@ -96,7 +128,7 @@ import numpy as np
 #左右都找到 → 用均值；
 #只有一侧找到 → 用该侧值；
 #都没找到 → 用 min_value 或 max_value 替代
-def nanopore_filter_noise_bak(signal, min_value, max_value, search_range=10):
+def nanopore_repair_error_bak(signal, min_value, max_value, search_range=10):
     """
     Replace outliers in signal using local neighborhood within `search_range`.
     
@@ -162,13 +194,20 @@ def nanopore_filter_noise_bak(signal, min_value, max_value, search_range=10):
 
 import numpy as np
 
-def nanopore_filter_noise(signal, min_value, max_value):
+def nanopore_repair_error(signal, min_value, max_value):
     """
     Fast version: only process outlier indices in increasing order.
     Uses the fact that cleaned[i] depends only on cleaned[i-1],
     and i-1 is always processed before i if we go left-to-right.
     """
     signal = np.asarray(signal, dtype=np.float32)
+    if np.any(signal < min_value) or np.any(signal > max_value):
+        do_repair = True
+    else:
+        do_repair = False
+    if not do_repair:
+        return signal
+
     cleaned = signal.copy()
     n = cleaned.size
 
@@ -191,6 +230,49 @@ def nanopore_filter_noise(signal, min_value, max_value):
                 cleaned[0] = min_value
         else:
             # Use immediate left neighbor (which is already final)
+            cleaned[i] = cleaned[i - 1]
+    return cleaned
+
+
+def nanopore_remove_spikes(
+    signal,
+    window_size=5001,
+    mad_factor=1.4826,
+    min_mad=1.0,
+    spike_threshold=5.0
+):
+    """
+    Detect and remove spikes using global MAD on baseline-removed residual.
+    Spikes are repaired using forward-fill (left-to-right).
+    
+    Returns:
+        cleaned: np.ndarray, repaired signal (same shape as input)
+    """
+    signal = np.asarray(signal, dtype=np.float32)
+    
+    # 1. Estimate baseline with median filter
+    local_med = median_filter(signal, size=window_size, mode='reflect')
+    
+    # 2. Compute residual
+    residual = signal - local_med
+    
+    # 3. Global MAD on residual
+    global_mad = mad_factor * np.median(np.abs(residual))
+    global_mad = max(global_mad, min_mad)
+    
+    # 4. Detect spikes
+    is_spike = np.abs(residual) > (spike_threshold * global_mad)
+    
+    if not np.any(is_spike):
+        return signal.copy()
+
+    # 5. Repair spikes using forward-fill
+    cleaned = signal.copy()
+    outlier_indices = np.where(is_spike)[0]
+    for i in outlier_indices:
+        if i == 0:
+            cleaned[0] = local_med[0]
+        else:
             cleaned[i] = cleaned[i - 1]
     return cleaned
 
