@@ -1,10 +1,10 @@
 import numpy as np
-from nanopore_signal_tokenizer import KmeansTokenizer
+from nanopore_signal_tokenizer.kmeans_tokenizer import KmeansTokenizer
 
 tokenizer = KmeansTokenizer(
     window_size=32,
     stride=5,
-    centroids_path="nanopore_signal_tokenizer/kmeans/0.4b_centroids_8192.npy",
+    centroids_path="../models/centroids.npy",
 )
 
 # 模拟一段 1200 点的信号（~240ms @ 5kHz）

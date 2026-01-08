@@ -1,6 +1,7 @@
 # Model checkpoints and numpy arrays
 *.pth
 *.npy
+!centroids.npy
 *.bin
 *.gz
 *.out
