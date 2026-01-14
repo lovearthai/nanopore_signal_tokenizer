@@ -18,19 +18,17 @@ class KmeansTokenizer:
 
     def __init__(
         self,
-        window_size: int,
-        stride: int,
         centroids_path: str,
     ):
         """
         初始化 tokenizer。
         """
-        self.window_size = window_size
-        self.stride = stride
-        self.index = self._init_worker(centroids_path)
+        data = np.load(centroids_path, allow_pickle=True).item()
+        self.window_size = data["dimension"]
+        self.stride = data["stride"]
+        self.index = self._init_worker(data["centroids"])
 
-    def _init_worker(self, centroids_path: str):
-        centroids = np.load(centroids_path).astype(np.float32)
+    def _init_worker(self, centroids):
         d = centroids.shape[1]
         if hasattr(faiss, 'StandardGpuResources'):
         # === GPU 模式 ===
