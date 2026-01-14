@@ -1,5 +1,5 @@
 import numpy as np
-from nanopore_signal_tokenizer.kmeans_tokenizer import KmeansTokenizer
+from nanopore_signal_tokenizer import KmeansTokenizer
 
 tokenizer = KmeansTokenizer(
     centroids_path="../models/centroids_with_meta.npy",
