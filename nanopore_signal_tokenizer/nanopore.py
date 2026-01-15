@@ -69,7 +69,7 @@ def nanopore_normalize_hybrid_v1(signal, window_size=2000, mad_factor=1.4826, mi
     normalized = (signal - local_med) / global_mad
     return normalized.astype(np.float32),global_mad
 
-def nanopore_normalize_hybrid(signal, window_size=2000, mad_factor=1.4826, min_mad=1.0):
+def nanopore_normalize_hybrid(signal, window_size=5000, mad_factor=1.4826, min_mad=1.0):
     """
     Hybrid normalization: remove baseline drift with local median, scale with global MAD of residuals.
     """
@@ -79,6 +79,7 @@ def nanopore_normalize_hybrid(signal, window_size=2000, mad_factor=1.4826, min_m
     # Local median to track baseline drift
     # 下面两句代码相当于高通滤波
     local_med = median_filter(signal, size=window_size, mode='reflect')
+
     # Residual after removing baseline
     residual = signal - local_med
     # Global MAD on residuals (robust scale estimate)
@@ -87,6 +88,26 @@ def nanopore_normalize_hybrid(signal, window_size=2000, mad_factor=1.4826, min_m
     # Normalize by global MAD
     normalized = residual / global_mad
     return normalized.astype(np.float32), global_mad
+
+
+def nanopore_normalize_new(signal):
+    """
+    Normalize by subtracting global median and scaling with robust MAD
+    estimated from central 98% of residuals (1st to 99th percentile).
+    """
+    signal_MED = np.median(signal)
+    residual = signal - signal_MED
+
+    # Use 1st and 99th percentiles to exclude extreme outliers
+    q01, q99 = np.quantile(residual, [0.01, 0.99])
+    masked_residual = residual[(residual >= q01) & (residual <= q99)]
+
+    # Robust scale estimate (MAD)
+    global_MAD = 1.4826 * np.median(np.abs(masked_residual))
+    global_MAD = max(global_MAD, 1.0)  # avoid division by near-zero
+
+    normalized = residual / global_MAD
+    return normalized.astype(np.float32), global_MAD  # ✅ fixed variable name
 
 import numpy as np
 from scipy.ndimage import median_filter

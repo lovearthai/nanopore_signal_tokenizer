@@ -4,6 +4,7 @@ from .nanopore import nanopore_normalize
 from .nanopore import nanopore_normalize_local
 from .nanopore import nanopore_normalize_hybrid_v1
 from .nanopore import nanopore_normalize_hybrid
+from .nanopore import nanopore_normalize_new
 from .nanopore import nanopore_filter
 from .nanopore import nanopore_repair_error
 from .nanopore import nanopore_repair_normal
