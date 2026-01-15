@@ -1,5 +1,5 @@
 
-from nanopore_signal_tokenizer.nanopore import nanopore_normalize
+from .signal_normal import nanopore_normalize, nanopore_filter_signal
 import faiss
 import gzip
 import json
@@ -18,19 +18,17 @@ class KmeansTokenizer:
 
     def __init__(
         self,
-        window_size: int,
-        stride: int,
         centroids_path: str,
     ):
         """
         初始化 tokenizer。
         """
-        self.window_size = window_size
-        self.stride = stride
-        self.index = self._init_worker(centroids_path)
+        data = np.load(centroids_path, allow_pickle=True).item()
+        self.window_size = data["dimension"]
+        self.stride = data["stride"]
+        self.index = self._init_worker(data["centroids"])
 
-    def _init_worker(self, centroids_path: str):
-        centroids = np.load(centroids_path).astype(np.float32)
+    def _init_worker(self, centroids):
         d = centroids.shape[1]
         if hasattr(faiss, 'StandardGpuResources'):
         # === GPU 模式 ===
@@ -48,7 +46,7 @@ class KmeansTokenizer:
             index = cpu_index
         return index
     
-    def _sliding_window_chunks(self, signal, window_size=32, stride=8):
+    def _sliding_window_chunks(self, signal):
         """
         对一维信号进行滑动窗口切片。
 
@@ -64,26 +62,26 @@ class KmeansTokenizer:
                             - vector 是切片本身的值
         """
         n_points = len(signal)
-        if n_points < window_size:
+        if n_points < self.window_size:
             return []
 
         chunks_info = []
         start = 0
-        while start + window_size <= n_points:
-            end = start + window_size
+        while start + self.window_size <= n_points:
+            end = start + self.window_size
             chunk = signal[start:end]
             chunks_info.append((start, end, chunk))
-            start += stride
-
+            start += self.stride
         return chunks_info
 
     def tokenize_data(self, signal: np.ndarray) -> str:
         # Normalize
-        norm_sig = nanopore_normalize(signal)
+        norm_sig_no_filter = nanopore_normalize(signal)
+        norm_sig = nanopore_filter_signal(norm_sig_no_filter) # 进行去噪处理
         if norm_sig.size == 0:
             return ""
         vec_list = []
-        chunks_info = self._sliding_window_chunks(norm_sig, window_size=self.window_size, stride=self.stride)
+        chunks_info = self._sliding_window_chunks(norm_sig)
         for _, _, chunk in chunks_info:
             if chunk.size == 0:
                 continue
@@ -122,8 +120,8 @@ class KmeansTokenizer:
 
         return self.tokenize_data(scaled)
 
-
-    def tokenize_fast5_file(self, fast5_path: str, output_path: str):
+ 
+    def tokenize_fast5(self, fast5_path: str, output_path: str):
         print(f"✅ Process {fast5_path}")
         """内部方法：处理单个 FAST5 → JSONL.GZ"""
         results = []

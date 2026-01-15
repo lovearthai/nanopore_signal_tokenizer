@@ -12,7 +12,7 @@ from .nanopore import nanopore_remove_spikes
 from .fast5 import Fast5Dir
 from .vq_tokenizer import VQTokenizer
 from .rvq_tokenizer import RVQTokenizer
-from .kmeans_tokenizer import KmeansTokenizer
+from .kms.kmeans_tokenizer import KmeansTokenizer
 from .rvq_model import NanoporeRVQModel
 from .vq_model import NanoporeVQModel
 from .vq_train import vq_train 
