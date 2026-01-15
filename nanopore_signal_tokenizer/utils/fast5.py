@@ -8,7 +8,12 @@ import json  # 【新增】用于保存全局汇总报告
 import numpy as np
 import glob
 from ont_fast5_api.fast5_interface import get_fast5_file
-from .nanopore import nanopore_normalize,nanopore_repair_normal,nanopore_remove_spikes,nanopore_normalize_hybrid,nanopore_normalize_new,nanopore_repair_error, nanopore_filter
+from .signal import (
+    nanopore_remove_spikes,
+    nanopore_normalize_novel,
+    nanopore_normalize_huada,
+    nanopore_repair_errors 
+    )
 from scipy.signal import medfilt
 from pathos.multiprocessing import ProcessPool
 from multiprocessing import cpu_count
@@ -216,7 +221,7 @@ class Fast5Dir:
                         continue
 
                     # 使用 nanopore_repair_error 过滤极端异常值
-                    signal_clr = nanopore_repair_error(signal_raw, signal_min_value, signal_max_value)
+                    signal_clr = nanopore_repair_errors(signal_raw, signal_min_value, signal_max_value)
                     # 再次检查是否仍有越界（理论上应已修复，但保险起见）
                     if np.any(signal_clr < signal_min_value) or np.any(signal_clr > signal_max_value):
                         print(f"⚠️ Read {read.read_id} still out of raw range after filtering, skipped.")
@@ -226,7 +231,7 @@ class Fast5Dir:
                     signal_nos = nanopore_remove_spikes(signal_clr, window_size=window_size, spike_threshold=5.0)
                     
                     # 因为repair里有abs(raw-med)这一步，所以必须在这步前修复数据，把极端大的值给干掉,也就是必须repair
-                    signal_nom, global_mad = nanopore_normalize_new(signal_nos)
+                    signal_nom, global_mad = nanopore_normalize_novel(signal_nos)
 
                     #signal_nom = nanopore_repair_normal(signal_nom, NORM_SIG_MIN, NORM_SIG_MAX,window_size=33)
                     # 应用中值滤波（注意：此处原代码已强制开启，但参数控制仍保留）

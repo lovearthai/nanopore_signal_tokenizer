@@ -5,3 +5,4 @@
 *.bin
 *.gz
 *.out
+nanopore_signal_tokenizer.egg-info
